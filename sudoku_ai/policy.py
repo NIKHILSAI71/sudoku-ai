@@ -291,7 +291,7 @@ def train_supervised(
     except Exception:
         scaler = torch.cuda.amp.GradScaler(enabled=amp)
         autocast_cm = lambda: torch.cuda.amp.autocast(enabled=amp)
-    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
 
     def _loader(ds: Dataset, shuffle: bool) -> DataLoader:
         return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=0, generator=g)
