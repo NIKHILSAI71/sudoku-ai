@@ -1,0 +1,5 @@
+cli
+sudoku_ai
+sudoku_engine
+sudoku_solvers
+ui
