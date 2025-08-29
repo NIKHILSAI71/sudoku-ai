@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from sudoku_engine import parse_line, Board, board_to_line
 from sudoku_solvers import backtracking
-from .data import build_supervised_records
+from .data import build_supervised_records, make_partial_samples, random_augment
 
 
 def board_to_tensor(line: str) -> torch.Tensor:
@@ -226,15 +226,35 @@ def train_supervised(
     if not puzzles:
         raise ValueError("No training puzzles found. Provide --dataset or --puzzles")
 
-    items = _prepare_supervised_items(puzzles, solutions, max_samples=max_samples, augment=augment)
-    # Shuffle deterministically, then split train/val
-    if len(items) == 0:
+    # Build grouped samples per puzzle to avoid leakage between train/val
+    groups: List[List[Tuple[str, torch.Tensor]]] = []
+    total_added = 0
+    for pz, sol in zip(puzzles, solutions or []):
+        if augment:
+            pz, sol = random_augment(pz, sol, enable=True)
+        samples = make_partial_samples(pz, sol, steps=40)
+        group_items: List[Tuple[str, torch.Tensor]] = []
+        for line, tgt_np in samples:
+            t = torch.from_numpy(tgt_np.astype('int64'))
+            group_items.append((line, t))
+            total_added += 1
+            if max_samples is not None and total_added >= max_samples:
+                break
+        if group_items:
+            groups.append(group_items)
+        if max_samples is not None and total_added >= max_samples:
+            break
+    if not groups:
         raise ValueError("No supervised items prepared. Check dataset or solver availability.")
-    perm = torch.randperm(len(items), generator=g).tolist()
-    items = [items[i] for i in perm]
-    val_n = int(len(items) * val_split)
-    val_items = items[:val_n]
-    train_items = items[val_n:]
+    # Shuffle groups deterministically and split
+    gperm = torch.randperm(len(groups), generator=g).tolist()
+    groups = [groups[i] for i in gperm]
+    val_gn = max(1, int(len(groups) * val_split)) if len(groups) > 1 and val_split > 0 else 0
+    val_groups = groups[:val_gn]
+    train_groups = groups[val_gn:]
+    # Flatten
+    val_items = [it for grp in val_groups for it in grp]
+    train_items = [it for grp in train_groups for it in grp]
 
     train_ds = _SupDataset(train_items)
     val_ds = _SupDataset(val_items) if val_items else None
