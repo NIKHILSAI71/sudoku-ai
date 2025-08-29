@@ -160,7 +160,7 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         console.print("PyTorch is required for ai-solve. Please install torch.", style="red")
         logger.exception("torch import failed")
         raise SystemExit(3)
-    from sudoku_ai.policy import load_policy, train_toy, train_supervised
+    from sudoku_ai.policy import load_policy, train_supervised
     from sudoku_engine import board_to_line as _to_line
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
@@ -211,7 +211,7 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
                 )
                 # If no puzzle provided, this was a training-only run
                 if args.input is None and args.stdin is None:
-                    policy = load_policy(args.ckpt, device=device)
+                    _ = load_policy(args.ckpt, device=device)
                     console.print(f"Training complete. Checkpoint saved -> {ckpt}")
                     logger.info("training-only run complete -> %s", ckpt)
                     console.print(f"Log saved -> {log_path}")
@@ -246,8 +246,10 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
                     overfit_size=min(1024, max(100, limit)),
                 )
         except Exception as e:
-            logger.exception("supervised training failed; falling back to toy training: %s", e)
-            train_toy(epochs=epochs, limit=limit, out_path=str(ckpt))
+            logger.exception("supervised training failed: %s", e)
+            console.print("Training failed. Resolve the dataset/puzzles issue or omit --train.", style="red")
+            console.print(f"Log saved -> {log_path}")
+            raise SystemExit(3)
         # If still no board (i.e., dataset training and no input), treat as training-only
         if board is None and args.input is None and args.stdin is None:
             _ = load_policy(args.ckpt, device=device)
@@ -282,8 +284,32 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         console.print(f"Log saved -> {log_path}")
         raise SystemExit(2)
 
+    # Enable deterministic propagation to strengthen AI solving
+    stats = backtracking.Stats()
+    opts = Options(
+        naked_singles=True,
+        hidden_singles=True,
+        pointing_pairs=True,
+        naked_pairs=True,
+        hidden_pairs=True,
+        hidden_triples=True,
+        x_wing=True,
+    )
+
+    def propagate(board_obj: Board) -> None:
+        run_pipeline(board_obj, max_iters=100, trace=t if args.trace else None, options=opts, stats=stats.heuristics)
+        if not valid_state(board_obj):
+            msg_ = "Propagation reached an invalid state."
+            console.print(msg_, style="red")
+            logger.error(msg_)
+            console.print(f"Log saved -> {log_path}")
+            raise SystemExit(1)
+
+    # Initial propagation pass
+    propagate(b)
+
     max_steps = args.max_steps
-    # Pure policy sampling loop (no greedy, no propagation)
+    # Policy sampling loop with propagation after each accepted move
     temperature = max(1e-6, float(getattr(args, "temperature", 1.0)))
     for step in range(max_steps):
         if b.is_complete():
@@ -345,6 +371,8 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             logger.error(msg)
             console.print(f"Log saved -> {log_path}")
             raise SystemExit(1)
+        # Run propagation after every successful policy move
+        propagate(b)
 
     # No final fallback; AI must have completed by here or exited
 
@@ -423,7 +451,7 @@ def main() -> None:
         "ai-solve",
         aliases=["ai-slove"],
         help="solve puzzle using a policy checkpoint",
-    description="Solve a Sudoku using a trained policy (no propagation).",
+    description="Solve a Sudoku using a trained policy with constraint propagation.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap_ai.add_argument("-i", "--input", type=str, default=None, help="Path to input puzzle (single-line .sdk format)")
