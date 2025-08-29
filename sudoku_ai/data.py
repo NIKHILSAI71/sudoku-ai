@@ -109,40 +109,45 @@ def make_partial_samples(puzzle: str, solution: str, steps: int = 40) -> List[Tu
     """
     Create a sequence of (partial_board_line, targets) pairs from a full solution.
     targets is an (81,) int array with -100 for givens (ignore), and 0..8 for solution digit-1 on empties.
-    The sequence is created by starting from the solution and restoring givens from the puzzle, then
-    progressively removing additional cells in random order up to `steps` samples.
+    The sequence is created by starting from the original puzzle and progressively filling in cells from the solution.
     """
     g_puz = parse_line(puzzle)
     g_sol = parse_line(solution)
-    givens_mask = (g_puz > 0)
-    # start from current puzzle state
-    cur = g_puz.copy()
+
+    # Non-given cells, in a random order
+    sol_indices = [i for i, p_val in enumerate(g_puz.flatten()) if p_val == 0]
+    random.shuffle(sol_indices)
+
     samples: List[Tuple[str, np.ndarray]] = []
 
-    # candidate removal order: start from the puzzle and progressively remove original givens
-    # (i.e., positions that were filled in the puzzle)
-    fill_positions = [i for i in range(81) if givens_mask.reshape(-1)[i]]
-    random.shuffle(fill_positions)
-
-    # produce one sample for the original puzzle too
-    targets0 = np.full((81,), -100, dtype=np.int64)
-    sol_flat = g_sol.reshape(-1)
-    cur_flat = cur.reshape(-1)
+    # 1. The original puzzle is the first sample
+    targets = np.full((81,), -100, dtype=np.int64)
+    sol_flat = g_sol.flatten()
+    puz_flat = g_puz.flatten()
     for i in range(81):
-        if cur_flat[i] == 0:
-            targets0[i] = int(sol_flat[i]) - 1
-    samples.append((_line_from_grid(cur), targets0))
+        if puz_flat[i] == 0:
+            targets[i] = sol_flat[i] - 1
+    samples.append((puzzle, targets.copy()))
 
-    for k in range(min(steps, len(fill_positions))):
-        idx = fill_positions[k]
-        r, c = divmod(idx, 9)
-        cur[r, c] = 0
-        targets = np.full((81,), -100, dtype=np.int64)
-        cur_flat = cur.reshape(-1)
-        for i in range(81):
-            if cur_flat[i] == 0:
-                targets[i] = int(sol_flat[i]) - 1
-        samples.append((_line_from_grid(cur), targets))
+    # 2. Create more samples by filling in solution cells one by one
+    cur = g_puz.copy()
+
+    # Progressively fill up to `steps` cells
+    num_to_fill = min(steps, len(sol_indices) - 1)
+    for i in range(num_to_fill):
+        idx_to_fill = sol_indices[i]
+        r, c = divmod(idx_to_fill, 9)
+        cur[r, c] = g_sol[r, c]
+
+        # For this new board, create the targets for remaining empty cells
+        targets.fill(-100)
+        cur_flat = cur.flatten()
+        for j in range(81):
+            if cur_flat[j] == 0:
+                targets[j] = sol_flat[j] - 1
+
+        samples.append((_line_from_grid(cur), targets.copy()))
+
     return samples
 
 
