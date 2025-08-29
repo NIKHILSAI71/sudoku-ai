@@ -144,6 +144,9 @@ def cmd_solve(args: argparse.Namespace) -> None:
 
 def cmd_train(args: argparse.Namespace) -> None:
     logger, log_path = _init_logger("train")
+    # Back-compat: allow --itr as alias for --epochs
+    if getattr(args, "itr", None) is not None:
+        args.epochs = args.itr
     logger.info(
         "train start: epochs=%d limit=%s out=%s dataset=%s puzzles=%s solutions=%s amp=%s",
         args.epochs,
@@ -162,8 +165,14 @@ def cmd_train(args: argparse.Namespace) -> None:
     def _progress(ep: int, loss: float, acc: float) -> None:
         logger.info("epoch %d: loss=%.6f acc=%.4f", ep, loss, acc)
 
-    # If a dataset path or puzzles file is provided, run the supervised pipeline; otherwise keep toy
-    if getattr(args, "dataset", None) or getattr(args, "puzzles", None):
+    # If a dataset path (that exists) or puzzles file is provided, run supervised; otherwise run toy
+    ds_arg = getattr(args, "dataset", None)
+    ds_exists = False
+    try:
+        ds_exists = bool(ds_arg) and Path(ds_arg).exists()
+    except Exception:
+        ds_exists = False
+    if ds_exists or getattr(args, "puzzles", None):
         _ = train_supervised(
             out_path=str(ckpt),
             dataset_jsonl=getattr(args, "dataset", None),
@@ -400,6 +409,8 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap_train.add_argument("--epochs", type=int, default=1, help="Number of training epochs")
+    # Deprecated alias for legacy scripts; maps to --epochs if provided
+    ap_train.add_argument("--itr", type=int, help="Deprecated alias for --epochs")
     ap_train.add_argument("--limit", type=int, default=500, help="Max samples (toy or supervised)")
     ap_train.add_argument("--out", type=str, default="checkpoints/policy.pt", help="Where to save the checkpoint")
     # Supervised options (optional)
