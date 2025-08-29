@@ -263,7 +263,13 @@ def train_supervised(
     model = ResNetPolicy().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, epochs))
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    # AMP: prefer torch.amp API with fallback for older torch
+    try:
+        scaler = torch.amp.GradScaler('cuda', enabled=amp)
+        autocast_cm = lambda: torch.amp.autocast('cuda', enabled=amp)
+    except Exception:
+        scaler = torch.cuda.amp.GradScaler(enabled=amp)
+        autocast_cm = lambda: torch.cuda.amp.autocast(enabled=amp)
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
     def _loader(ds: Dataset, shuffle: bool) -> DataLoader:
@@ -281,7 +287,7 @@ def train_supervised(
         for xb, yb in _loader(train_ds, shuffle=True):
             xb = xb.to(device)
             yb = yb.to(device)
-            with torch.cuda.amp.autocast(enabled=amp):
+            with autocast_cm():
                 logits = model(xb)
                 loss = loss_fn(logits.view(-1, 9), yb.view(-1))
             opt.zero_grad(set_to_none=True)
@@ -315,7 +321,8 @@ def train_supervised(
                 for xb, yb in _loader(val_ds, shuffle=False):
                     xb = xb.to(device)
                     yb = yb.to(device)
-                    logits = model(xb)
+                    with autocast_cm():
+                        logits = model(xb)
                     loss = loss_fn(logits.view(-1, 9), yb.view(-1))
                     val_loss += float(loss.item()) * xb.size(0) * 81
                     val_cnt += xb.size(0) * 81

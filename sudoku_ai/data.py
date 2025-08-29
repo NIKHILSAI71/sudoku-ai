@@ -119,8 +119,9 @@ def make_partial_samples(puzzle: str, solution: str, steps: int = 40) -> List[Tu
     cur = g_puz.copy()
     samples: List[Tuple[str, np.ndarray]] = []
 
-    # candidate removal order: empty cells in the puzzle first are already zero; select from filled cells
-    fill_positions = [i for i in range(81) if not givens_mask.reshape(-1)[i]]
+    # candidate removal order: start from the puzzle and progressively remove original givens
+    # (i.e., positions that were filled in the puzzle)
+    fill_positions = [i for i in range(81) if givens_mask.reshape(-1)[i]]
     random.shuffle(fill_positions)
 
     # produce one sample for the original puzzle too
