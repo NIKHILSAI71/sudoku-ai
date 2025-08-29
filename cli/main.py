@@ -18,7 +18,7 @@ from ui.tui import render_pretty
 console = Console()
 
 
-def _init_logger(run_type: str) -> tuple[logging.Logger, Path]:
+def _init_logger(run_type: str, add_stdout: bool = False) -> tuple[logging.Logger, Path]:
     logs_dir = Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -34,7 +34,13 @@ def _init_logger(run_type: str) -> tuple[logging.Logger, Path]:
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    # Do not add a console StreamHandler to avoid duplicate TUI output
+    # Optionally mirror logs to stdout (useful for notebook training progress)
+    if add_stdout:
+        ch = logging.StreamHandler()
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
+
+    # For TUI-heavy commands we avoid console handlers by default
     return logger, log_path
 
 
@@ -143,7 +149,8 @@ def cmd_solve(args: argparse.Namespace) -> None:
 
 
 def cmd_train(args: argparse.Namespace) -> None:
-    logger, log_path = _init_logger("train")
+    # Enable stdout logging for training so progress shows up in notebooks/terminals
+    logger, log_path = _init_logger("train", add_stdout=True)
     # Back-compat: allow --itr as alias for --epochs
     if getattr(args, "itr", None) is not None:
         args.epochs = args.itr
@@ -167,12 +174,18 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     # If a dataset path (that exists) or puzzles file is provided, run supervised; otherwise run toy
     ds_arg = getattr(args, "dataset", None)
+    puzzles_arg = getattr(args, "puzzles", None)
     ds_exists = False
+    puzzles_exists = False
     try:
         ds_exists = bool(ds_arg) and Path(ds_arg).exists()
     except Exception:
         ds_exists = False
-    if ds_exists or getattr(args, "puzzles", None):
+    try:
+        puzzles_exists = bool(puzzles_arg) and Path(puzzles_arg).exists()
+    except Exception:
+        puzzles_exists = False
+    if ds_exists or puzzles_exists:
         _ = train_supervised(
             out_path=str(ckpt),
             dataset_jsonl=getattr(args, "dataset", None),

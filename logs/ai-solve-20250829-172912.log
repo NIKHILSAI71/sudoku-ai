@@ -1,4 +1,0 @@
-2025-08-29 17:29:12,341 INFO: ai-solve start: input=D:\Downloads\creative\sudoku\examples\easy1.sdk ckpt=checkpoints/policy.pt cpu=False no-prop=False max-steps=200
-2025-08-29 17:29:13,647 INFO: device: cpu
-2025-08-29 17:29:13,664 INFO: solution: 534678912672195348198342567859761423426853791713924856961537284287419635345286179
-2025-08-29 17:29:13,664 INFO: ai-solve end
