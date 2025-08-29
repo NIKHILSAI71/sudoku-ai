@@ -160,7 +160,7 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         console.print("PyTorch is required for ai-solve. Please install torch.", style="red")
         logger.exception("torch import failed")
         raise SystemExit(3)
-    from sudoku_ai.policy import load_policy, train_toy
+    from sudoku_ai.policy import load_policy, train_toy, train_supervised
     from sudoku_engine import board_to_line as _to_line
 
     board = _load_board(args.input, args.stdin)
@@ -180,14 +180,60 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         return True
 
     b = board.copy()
-    # Optional on-the-fly training: if requested, (re)train a tiny policy before solving
+    # Optional on-the-fly training: if requested, run quick supervised training from the input puzzle
     if getattr(args, "train", False):
         ckpt = Path(args.ckpt)
         ckpt.parent.mkdir(parents=True, exist_ok=True)
         epochs = int(getattr(args, "train_epochs", 1))
         limit = int(getattr(args, "train_limit", 500))
-        logger.info("training policy: epochs=%d limit=%d -> %s", epochs, limit, ckpt)
-        train_toy(epochs=epochs, limit=limit, out_path=str(ckpt))
+        dataset = getattr(args, "dataset", None)
+        puzzles_path = getattr(args, "puzzles", None)
+        solutions_path = getattr(args, "solutions", None)
+        try:
+            if dataset or puzzles_path:
+                logger.info(
+                    "supervised training from dataset: epochs=%d max_samples=%d dataset=%s puzzles=%s solutions=%s -> %s",
+                    epochs, limit, dataset, puzzles_path, solutions_path, ckpt,
+                )
+                _ = train_supervised(
+                    out_path=str(ckpt),
+                    dataset_jsonl=dataset,
+                    puzzles_path=puzzles_path,
+                    solutions_path=solutions_path,
+                    epochs=max(1, epochs),
+                    batch_size=64,
+                    lr=3e-4,
+                    val_split=0.1,
+                    max_samples=max(100, limit),
+                    augment=True,
+                    amp=False,
+                    seed=42,
+                    overfit=False,
+                )
+            else:
+                logger.info("supervised training from input: epochs=%d max_samples=%d -> %s", epochs, limit, ckpt)
+                # Write a temporary puzzles file with the single input puzzle line
+                tmp_puzzles = ckpt.parent / "_tmp_puzzles.txt"
+                tmp_puzzles.write_text(board_to_line(board.grid) + "\n", encoding="utf-8")
+                _ = train_supervised(
+                    out_path=str(ckpt),
+                    dataset_jsonl=None,
+                    puzzles_path=str(tmp_puzzles),
+                    solutions_path=None,  # solver will create solutions
+                    epochs=max(1, epochs),
+                    batch_size=32,
+                    lr=3e-4,
+                    val_split=0.0,
+                    max_samples=max(100, limit),
+                    augment=True,
+                    amp=False,
+                    seed=42,
+                    overfit=True,
+                    overfit_size=min(1024, max(100, limit)),
+                )
+        except Exception as e:
+            logger.exception("supervised training failed; falling back to toy training: %s", e)
+            train_toy(epochs=epochs, limit=limit, out_path=str(ckpt))
         policy = load_policy(args.ckpt, device=device)
     if not valid_state(b):
         msg = "Unsolvable or contradictory starting board"
@@ -350,6 +396,9 @@ def main() -> None:
     ap_ai.add_argument("--train", action="store_true", help="Train a tiny policy before solving (toy)")
     ap_ai.add_argument("--train-epochs", type=int, default=1, help="Epochs for on-the-fly training")
     ap_ai.add_argument("--train-limit", type=int, default=500, help="Samples limit for on-the-fly training")
+    ap_ai.add_argument("--dataset", type=str, default=None, help="Path to JSONL dataset with 'puzzle' and optional 'solution'")
+    ap_ai.add_argument("--puzzles", type=str, default=None, help="Path to text file of puzzles (one per line)")
+    ap_ai.add_argument("--solutions", type=str, default=None, help="Path to text file of solutions (one per line; optional)")
     # Propagation flags removed for AI-only mode
     ap_ai.add_argument("--pretty", action="store_true", help="Pretty-print the final grid as a 9x9 board")
     ap_ai.add_argument("--trace", action="store_true", help="Log AI sampling decisions")
