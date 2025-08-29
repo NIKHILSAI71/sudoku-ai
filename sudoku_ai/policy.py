@@ -210,6 +210,10 @@ def train_supervised(
     augment: bool = True,
     amp: bool = False,
     seed: int = 42,
+    overfit: bool = False,
+    overfit_size: int = 512,
+    min_loss_to_stop: float = 5e-7,
+    min_acc_to_stop: float = 0.99999,
     progress_cb: Optional[Callable[[int, float, float], None]] = None,
 ) -> Dict[str, Any]:
     import json
@@ -280,12 +284,18 @@ def train_supervised(
     # Shuffle groups deterministically and split
     gperm = torch.randperm(len(groups), generator=g).tolist()
     groups = [groups[i] for i in gperm]
+    # Overfit mode disables validation and reduces training set to a tiny, fixed subset
+    if overfit:
+        val_split = 0.0
     val_gn = max(1, int(len(groups) * val_split)) if len(groups) > 1 and val_split > 0 else 0
     val_groups = groups[:val_gn]
     train_groups = groups[val_gn:]
     # Flatten
     val_items = [it for grp in val_groups for it in grp]
     train_items = [it for grp in train_groups for it in grp]
+
+    if overfit and len(train_items) > overfit_size:
+        train_items = train_items[:overfit_size]
 
     train_ds = _SupDataset(train_items)
     val_ds = _SupDataset(val_items) if val_items else None
@@ -309,7 +319,7 @@ def train_supervised(
         return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=0, generator=g)
 
     best_val = float('inf')
-    history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "val_acc": []}
+    history: Dict[str, List[float]] = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
 
     for ep in range(1, epochs + 1):
         model.train()
@@ -360,10 +370,10 @@ def train_supervised(
                 preds = masked_logits.argmax(dim=-1)  # (B,81)
                 mask = (yb != -100)
                 train_correct += (preds[mask] == yb[mask]).float().sum().item()
-                train_total_labels += float(mask.sum().item())
-        sched.step()
-        train_loss = total_loss / max(1, total_cnt)
-        train_acc = (train_correct / train_total_labels) if train_total_labels > 0 else 0.0
+        train_total_labels += float(mask.sum().item())
+    sched.step()
+    train_loss = total_loss / max(1, total_cnt)
+    train_acc = (train_correct / train_total_labels) if train_total_labels > 0 else 0.0
 
         # Validation
         val_loss = 0.0
@@ -398,6 +408,7 @@ def train_supervised(
         val_loss = val_loss / max(1, val_cnt)
 
         history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
         if val_cnt > 0:
             history["val_loss"].append(val_loss)
             history["val_acc"].append(val_acc)
@@ -418,6 +429,10 @@ def train_supervised(
                     "val_split": val_split,
                 },
             }, out_path)
+
+        # Early stop for overfit mode (and when no validation): drive to zero loss and perfect acc
+        if (overfit or val_cnt == 0) and (train_loss <= min_loss_to_stop and train_acc >= min_acc_to_stop):
+            break
 
     return {"best_val": best_val, "history": history}
 

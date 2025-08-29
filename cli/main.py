@@ -199,6 +199,10 @@ def cmd_train(args: argparse.Namespace) -> None:
             augment=not getattr(args, "no_augment", False),
             amp=getattr(args, "amp", False),
             seed=getattr(args, "seed", 42),
+            overfit=getattr(args, "overfit", False),
+            overfit_size=getattr(args, "overfit_size", 512),
+            min_loss_to_stop=getattr(args, "min_loss_to_stop", 5e-7),
+            min_acc_to_stop=getattr(args, "min_acc_to_stop", 0.99999),
             progress_cb=_progress,
         )
     else:
@@ -436,6 +440,10 @@ def main() -> None:
     ap_train.add_argument("--seed", type=int, default=42, help="Random seed")
     ap_train.add_argument("--no-augment", action="store_true", help="Disable data augmentation")
     ap_train.add_argument("--amp", action="store_true", help="Enable mixed precision (AMP)")
+    ap_train.add_argument("--overfit", action="store_true", help="Overfit a tiny subset to drive ~100% train acc")
+    ap_train.add_argument("--overfit-size", type=int, default=512, help="Subset size for --overfit mode")
+    ap_train.add_argument("--min-loss-to-stop", type=float, default=5e-7, help="Early stop when train loss <= this (no val)")
+    ap_train.add_argument("--min-acc-to-stop", type=float, default=0.99999, help="Early stop when train acc >= this (no val)")
     ap_train.set_defaults(func=cmd_train)
 
     ap_eval = sub.add_parser(
