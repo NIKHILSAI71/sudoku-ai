@@ -248,6 +248,13 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         except Exception as e:
             logger.exception("supervised training failed; falling back to toy training: %s", e)
             train_toy(epochs=epochs, limit=limit, out_path=str(ckpt))
+        # If still no board (i.e., dataset training and no input), treat as training-only
+        if board is None and args.input is None and args.stdin is None:
+            _ = load_policy(args.ckpt, device=device)
+            console.print(f"Training complete. Checkpoint saved -> {ckpt}")
+            logger.info("training-only run complete -> %s", ckpt)
+            console.print(f"Log saved -> {log_path}")
+            return
         policy = load_policy(args.ckpt, device=device)
     else:
         # Not training, ensure we have an input board
@@ -261,7 +268,12 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         policy = load_policy(args.ckpt, device=device)
 
     # At this point we must have a board for solving
-    assert board is not None
+    if board is None:
+        msg = "No input puzzle provided for solving. Use -i/--stdin or run training-only with --dataset/--puzzles."
+        console.print(msg, style="red")
+        logger.error(msg)
+        console.print(f"Log saved -> {log_path}")
+        raise SystemExit(2)
     b = board.copy()
     if not valid_state(b):
         msg = "Unsolvable or contradictory starting board"
