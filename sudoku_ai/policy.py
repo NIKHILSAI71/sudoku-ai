@@ -23,6 +23,25 @@ def board_to_tensor(line: str) -> torch.Tensor:
     return x  # (10,9,9)
 
 
+def legal_mask_from_line(line: str) -> torch.Tensor:
+    """Build a (81,9) mask of legal digits for each cell from a board line.
+
+    1 for allowed digit, 0 otherwise. Filled cells will be all zeros.
+    """
+    b = Board(parse_line(line))
+    masks = b.candidates_mask()  # (9,9) int bitmasks
+    out = torch.zeros(81, 9, dtype=torch.float32)
+    for idx in range(81):
+        r, c = divmod(idx, 9)
+        m = int(masks[r, c])
+        if m == 0:
+            continue
+        for d in range(1, 10):
+            if m & (1 << (d - 1)):
+                out[idx, d - 1] = 1.0
+    return out
+
+
 class SmallPolicy(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -145,9 +164,11 @@ class _SupDataset(Dataset):
     def __len__(self) -> int:
         return len(self.items)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         line, tgt = self.items[idx]
-        return board_to_tensor(line), tgt
+        x = board_to_tensor(line)
+        m = legal_mask_from_line(line)
+        return x, tgt, m
 
 
 def _prepare_supervised_items(
@@ -284,12 +305,22 @@ def train_supervised(
         total_cnt = 0
         train_correct = 0.0
         train_total_labels = 0.0
-        for xb, yb in _loader(train_ds, shuffle=True):
+        for xb, yb, mb in _loader(train_ds, shuffle=True):
             xb = xb.to(device)
             yb = yb.to(device)
+            mb = mb.to(device)
             with autocast_cm():
                 logits = model(xb)
-                loss = loss_fn(logits.view(-1, 9), yb.view(-1))
+                # Ensure ground-truth digit is legal (in case of degenerate masks)
+                with torch.no_grad():
+                    y_flat = yb.view(-1)
+                    m_flat = mb.view(-1, 9)
+                    valid_pos = (y_flat >= 0)
+                    if valid_pos.any():
+                        idxs = torch.nonzero(valid_pos, as_tuple=False).squeeze(1)
+                        m_flat[idxs, y_flat[valid_pos]] = 1.0
+                masked_logits = logits.masked_fill(mb == 0, -1e9)
+                loss = loss_fn(masked_logits.view(-1, 9), yb.view(-1))
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             # Gradient clipping for stability
@@ -298,11 +329,15 @@ def train_supervised(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(opt)
             scaler.update()
-            total_loss += float(loss.item()) * xb.size(0) * 81
-            total_cnt += xb.size(0) * 81
+            # Count only non-ignored labels for averaging
+            with torch.no_grad():
+                valid = (yb != -100)
+                n_valid = int(valid.sum().item())
+            total_loss += float(loss.item()) * n_valid
+            total_cnt += n_valid
             # Train accuracy on non-masked labels
             with torch.no_grad():
-                preds = logits.argmax(dim=-1)  # (B,81)
+                preds = masked_logits.argmax(dim=-1)  # (B,81)
                 mask = (yb != -100)
                 train_correct += (preds[mask] == yb[mask]).float().sum().item()
                 train_total_labels += float(mask.sum().item())
@@ -318,16 +353,20 @@ def train_supervised(
         if val_ds is not None and len(val_ds) > 0:
             model.eval()
             with torch.no_grad():
-                for xb, yb in _loader(val_ds, shuffle=False):
+                for xb, yb, mb in _loader(val_ds, shuffle=False):
                     xb = xb.to(device)
                     yb = yb.to(device)
+                    mb = mb.to(device)
                     with autocast_cm():
                         logits = model(xb)
-                    loss = loss_fn(logits.view(-1, 9), yb.view(-1))
-                    val_loss += float(loss.item()) * xb.size(0) * 81
-                    val_cnt += xb.size(0) * 81
-                    preds = logits.argmax(dim=-1)  # (N,81)
-                    mask = (yb != -100)
+                        masked_logits = logits.masked_fill(mb == 0, -1e9)
+                    loss = loss_fn(masked_logits.view(-1, 9), yb.view(-1))
+                    valid = (yb != -100)
+                    n_valid = int(valid.sum().item())
+                    val_loss += float(loss.item()) * n_valid
+                    val_cnt += n_valid
+                    preds = masked_logits.argmax(dim=-1)  # (N,81)
+                    mask = valid
                     val_correct += (preds[mask] == yb[mask]).float().sum().item()
                     val_total_labels += float(mask.sum().item())
         val_acc = (val_correct / val_total_labels) if val_total_labels > 0 else 0.0
