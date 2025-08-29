@@ -75,7 +75,7 @@ class ResidualBlock(nn.Module):
 
 
 class ResNetPolicy(nn.Module):
-    def __init__(self, channels: int = 128, depth: int = 8) -> None:
+    def __init__(self, channels: int = 256, depth: int = 20) -> None:
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(10, channels, 3, padding=1, bias=False),
