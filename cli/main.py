@@ -18,6 +18,16 @@ from ui.tui import render_pretty
 console = Console()
 
 
+def _norm_path(p: str | None) -> str | None:
+    """Normalize a user-supplied path string across OSes.
+    Converts Windows backslashes to forward slashes so Linux shells
+    that eat backslashes (e.g., \\t, \\p) don't corrupt the path.
+    """
+    if not p:
+        return p
+    return p.replace("\\", "/")
+
+
 def _init_logger(run_type: str, add_stdout: bool = False) -> tuple[logging.Logger, Path]:
     logs_dir = Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -49,7 +59,8 @@ def _init_logger(run_type: str, add_stdout: bool = False) -> tuple[logging.Logge
 
 def _load_board(path: str | None, stdin_data: str | None) -> Board:
     if path:
-        text = Path(path).read_text(encoding="utf-8")
+        np = _norm_path(path) or path
+        text = Path(np).read_text(encoding="utf-8")
     else:
         text = stdin_data or ""
     grid = parse_line(text)
@@ -152,7 +163,7 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
     logger, log_path = _init_logger("ai-solve")
     logger.info(
     "ai-solve start: input=%s ckpt=%s cpu=%s max-steps=%d train=%s temperature=%.3f",
-    args.input or "<stdin>", args.ckpt, args.cpu, args.max_steps, getattr(args, "train", False), float(getattr(args, "temperature", 1.0)),
+    _norm_path(args.input) or "<stdin>", _norm_path(args.ckpt), args.cpu, args.max_steps, getattr(args, "train", False), float(getattr(args, "temperature", 1.0)),
     )
     try:
         import torch  # type: ignore
@@ -181,13 +192,13 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
     # Optional on-the-fly training: can run with dataset/puzzles without requiring an input board
     board: Board | None = None
     if getattr(args, "train", False):
-        ckpt = Path(args.ckpt)
+        ckpt = Path(_norm_path(args.ckpt) or "checkpoints/policy.pt")
         ckpt.parent.mkdir(parents=True, exist_ok=True)
         epochs = int(getattr(args, "train_epochs", 1))
         limit = int(getattr(args, "train_limit", 500))
-        dataset = getattr(args, "dataset", None)
-        puzzles_path = getattr(args, "puzzles", None)
-        solutions_path = getattr(args, "solutions", None)
+        dataset = _norm_path(getattr(args, "dataset", None))
+        puzzles_path = _norm_path(getattr(args, "puzzles", None))
+        solutions_path = _norm_path(getattr(args, "solutions", None))
         try:
             if dataset or puzzles_path:
                 logger.info(
@@ -211,7 +222,7 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
                 )
                 # If no puzzle provided, this was a training-only run
                 if args.input is None and args.stdin is None:
-                    _ = load_policy(args.ckpt, device=device)
+                    _ = load_policy(ckpt.as_posix(), device=device)
                     console.print(f"Training complete. Checkpoint saved -> {ckpt}")
                     logger.info("training-only run complete -> %s", ckpt)
                     console.print(f"Log saved -> {log_path}")
@@ -224,7 +235,7 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
                     logger.error(msg)
                     console.print(f"Log saved -> {log_path}")
                     raise SystemExit(2)
-                board = _load_board(args.input, args.stdin)
+                board = _load_board(_norm_path(args.input), args.stdin)
                 logger.info("supervised training from input: epochs=%d max_samples=%d -> %s", epochs, limit, ckpt)
                 # Write a temporary puzzles file with the single input puzzle line
                 tmp_puzzles = ckpt.parent / "_tmp_puzzles.txt"
@@ -252,12 +263,12 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             raise SystemExit(3)
         # If still no board (i.e., dataset training and no input), treat as training-only
         if board is None and args.input is None and args.stdin is None:
-            _ = load_policy(args.ckpt, device=device)
+            _ = load_policy(ckpt.as_posix(), device=device)
             console.print(f"Training complete. Checkpoint saved -> {ckpt}")
             logger.info("training-only run complete -> %s", ckpt)
             console.print(f"Log saved -> {log_path}")
             return
-        policy = load_policy(args.ckpt, device=device)
+        policy = load_policy(ckpt.as_posix(), device=device)
     else:
         # Not training, ensure we have an input board
         if args.input is None and args.stdin is None:
@@ -266,8 +277,8 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             logger.error(msg)
             console.print(f"Log saved -> {log_path}")
             raise SystemExit(2)
-        board = _load_board(args.input, args.stdin)
-        policy = load_policy(args.ckpt, device=device)
+        board = _load_board(_norm_path(args.input), args.stdin)
+        policy = load_policy(_norm_path(args.ckpt) or "checkpoints/policy.pt", device=device)
 
     # At this point we must have a board for solving
     if board is None:
