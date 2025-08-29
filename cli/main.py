@@ -407,7 +407,7 @@ def main() -> None:
     ap_train.add_argument("--puzzles", type=str, default=None, help="Path to file with puzzles, one per line")
     ap_train.add_argument("--solutions", type=str, default=None, help="Optional solutions file aligned with --puzzles")
     ap_train.add_argument("--batch-size", type=int, default=64, help="Batch size for supervised training")
-    ap_train.add_argument("--lr", type=float, default=1e-3, help="Learning rate for supervised training")
+    ap_train.add_argument("--lr", type=float, default=3e-4, help="Learning rate for supervised training")
     ap_train.add_argument("--val-split", type=float, default=0.1, help="Validation split fraction")
     ap_train.add_argument("--seed", type=int, default=42, help="Random seed")
     ap_train.add_argument("--no-augment", action="store_true", help="Disable data augmentation")

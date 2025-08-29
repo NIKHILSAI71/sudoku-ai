@@ -14,13 +14,16 @@ def _line_from_grid(grid: np.ndarray) -> str:
     return "".join(str(int(x)) for x in grid.reshape(-1))
 
 
-def _permute_digits(line: str) -> str:
-    perm = list(range(10))
+def _make_digit_mapping() -> List[int]:
     mapping = list(range(10))
     digits = list(range(1, 10))
     random.shuffle(digits)
     for src, dst in zip(range(1, 10), digits):
         mapping[src] = dst
+    return mapping
+
+
+def _apply_digit_mapping(line: str, mapping: List[int]) -> str:
     out = []
     for ch in line.strip():
         d = int(ch)
@@ -43,9 +46,10 @@ def _flip_v(grid: np.ndarray) -> np.ndarray:
 def random_augment(puzzle: str, solution: str, enable: bool = True) -> Tuple[str, str]:
     if not enable:
         return puzzle, solution
-    # digit permutation first (keeps validity)
-    puzzle = _permute_digits(puzzle)
-    solution = _permute_digits(solution)
+    # digit permutation first (same mapping for puzzle and solution)
+    mapping = _make_digit_mapping()
+    puzzle = _apply_digit_mapping(puzzle, mapping)
+    solution = _apply_digit_mapping(solution, mapping)
     # geometric transforms applied consistently
     g_puz = parse_line(puzzle)
     g_sol = parse_line(solution)

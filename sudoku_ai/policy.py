@@ -183,7 +183,7 @@ def train_supervised(
     solutions_path: Optional[str] = None,
     epochs: int = 10,
     batch_size: int = 64,
-    lr: float = 1e-3,
+    lr: float = 3e-4,
     val_split: float = 0.1,
     max_samples: Optional[int] = 20000,
     augment: bool = True,
@@ -227,7 +227,11 @@ def train_supervised(
         raise ValueError("No training puzzles found. Provide --dataset or --puzzles")
 
     items = _prepare_supervised_items(puzzles, solutions, max_samples=max_samples, augment=augment)
-    # Split train/val
+    # Shuffle deterministically, then split train/val
+    if len(items) == 0:
+        raise ValueError("No supervised items prepared. Check dataset or solver availability.")
+    perm = torch.randperm(len(items), generator=g).tolist()
+    items = [items[i] for i in perm]
     val_n = int(len(items) * val_split)
     val_items = items[:val_n]
     train_items = items[val_n:]
@@ -243,7 +247,7 @@ def train_supervised(
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
     def _loader(ds: Dataset, shuffle: bool) -> DataLoader:
-        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=0)
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=0, generator=g)
 
     best_val = float('inf')
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "val_acc": []}
@@ -252,20 +256,33 @@ def train_supervised(
         model.train()
         total_loss = 0.0
         total_cnt = 0
+        train_correct = 0.0
+        train_total_labels = 0.0
         for xb, yb in _loader(train_ds, shuffle=True):
             xb = xb.to(device)
             yb = yb.to(device)
             with torch.cuda.amp.autocast(enabled=amp):
                 logits = model(xb)
                 loss = loss_fn(logits.view(-1, 9), yb.view(-1))
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
+            # Gradient clipping for stability
+            if amp:
+                scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(opt)
             scaler.update()
             total_loss += float(loss.item()) * xb.size(0) * 81
             total_cnt += xb.size(0) * 81
+            # Train accuracy on non-masked labels
+            with torch.no_grad():
+                preds = logits.argmax(dim=-1)  # (B,81)
+                mask = (yb != -100)
+                train_correct += (preds[mask] == yb[mask]).float().sum().item()
+                train_total_labels += float(mask.sum().item())
         sched.step()
         train_loss = total_loss / max(1, total_cnt)
+        train_acc = (train_correct / train_total_labels) if train_total_labels > 0 else 0.0
 
         # Validation
         val_loss = 0.0
@@ -295,7 +312,7 @@ def train_supervised(
             history["val_acc"].append(val_acc)
 
         if progress_cb is not None:
-            progress_cb(ep, val_loss if val_cnt > 0 else train_loss, float(val_acc) if val_cnt > 0 else 0.0)
+            progress_cb(ep, val_loss if val_cnt > 0 else train_loss, float(val_acc) if val_cnt > 0 else float(train_acc))
 
         # Save best
         cur_val = val_loss if val_cnt > 0 else train_loss
