@@ -108,45 +108,38 @@ def read_puzzles(paths: Iterable[str]) -> List[str]:
 def make_partial_samples(puzzle: str, solution: str, steps: int = 40) -> List[Tuple[str, np.ndarray]]:
     """
     Create a sequence of (partial_board_line, targets) pairs from a full solution.
-    targets is an (81,) int array with -100 for givens (ignore), and 0..8 for solution digit-1 on empties.
-    The sequence is created by starting from the original puzzle and progressively filling in cells from the solution.
+    Each sample teaches the model to predict one next move.
+    - targets is an (81,) int array with -100 everywhere except for the one cell to be filled,
+      which has the target digit (0..8).
     """
     g_puz = parse_line(puzzle)
     g_sol = parse_line(solution)
 
-    # Non-given cells, in a random order
+    # Get indices of non-given cells, in a random order
     sol_indices = [i for i, p_val in enumerate(g_puz.flatten()) if p_val == 0]
     random.shuffle(sol_indices)
 
     samples: List[Tuple[str, np.ndarray]] = []
-
-    # 1. The original puzzle is the first sample
-    targets = np.full((81,), -100, dtype=np.int64)
-    sol_flat = g_sol.flatten()
-    puz_flat = g_puz.flatten()
-    for i in range(81):
-        if puz_flat[i] == 0:
-            targets[i] = sol_flat[i] - 1
-    samples.append((puzzle, targets.copy()))
-
-    # 2. Create more samples by filling in solution cells one by one
     cur = g_puz.copy()
 
-    # Progressively fill up to `steps` cells
-    num_to_fill = min(steps, len(sol_indices) - 1)
+    # Create up to `steps` samples, each teaching one move
+    num_to_fill = min(steps, len(sol_indices))
     for i in range(num_to_fill):
+        # The current board is the input
+        current_line = _line_from_grid(cur)
+
+        # The target is the next cell to fill
         idx_to_fill = sol_indices[i]
+        sol_digit = g_sol.flatten()[idx_to_fill]
+
+        targets = np.full((81,), -100, dtype=np.int64)
+        targets[idx_to_fill] = sol_digit - 1
+
+        samples.append((current_line, targets))
+
+        # Update the board for the next iteration
         r, c = divmod(idx_to_fill, 9)
-        cur[r, c] = g_sol[r, c]
-
-        # For this new board, create the targets for remaining empty cells
-        targets.fill(-100)
-        cur_flat = cur.flatten()
-        for j in range(81):
-            if cur_flat[j] == 0:
-                targets[j] = sol_flat[j] - 1
-
-        samples.append((_line_from_grid(cur), targets.copy()))
+        cur[r, c] = sol_digit
 
     return samples
 
