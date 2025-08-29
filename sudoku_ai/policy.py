@@ -218,6 +218,16 @@ def train_supervised(
     g = torch.Generator()
     g.manual_seed(seed)
     torch.manual_seed(seed)
+    try:
+        import random as _random
+        import numpy as _np
+        _random.seed(seed)
+        _np.random.seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
 
     puzzles: List[str] = []
     solutions: Optional[List[str]] = None
@@ -291,7 +301,9 @@ def train_supervised(
     except Exception:
         scaler = torch.cuda.amp.GradScaler(enabled=amp)
         autocast_cm = lambda: torch.cuda.amp.autocast(enabled=amp)
-    loss_fn = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
+    # We'll compute CE on only valid targets explicitly (no ignore_index/label_smoothing)
+    # to avoid pathological interactions and allow zero minimum loss.
+    loss_fn_none = nn.CrossEntropyLoss(reduction='none')
 
     def _loader(ds: Dataset, shuffle: bool) -> DataLoader:
         return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=0, generator=g)
@@ -320,7 +332,15 @@ def train_supervised(
                         idxs = torch.nonzero(valid_pos, as_tuple=False).squeeze(1)
                         m_flat[idxs, y_flat[valid_pos]] = 1.0
                 masked_logits = logits.masked_fill(mb == 0, -1e9)
-                loss = loss_fn(masked_logits.view(-1, 9), yb.view(-1))
+                # Compute loss only on positions with a real target
+                y_flat = yb.view(-1)
+                lg_flat = masked_logits.view(-1, 9)
+                valid_mask = (y_flat != -100)
+                if valid_mask.any():
+                    loss_vec = loss_fn_none(lg_flat[valid_mask], y_flat[valid_mask])
+                    loss = loss_vec.mean()
+                else:
+                    loss = lg_flat.sum() * 0.0  # zero, keeps graph/device
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             # Gradient clipping for stability
@@ -360,13 +380,18 @@ def train_supervised(
                     with autocast_cm():
                         logits = model(xb)
                         masked_logits = logits.masked_fill(mb == 0, -1e9)
-                    loss = loss_fn(masked_logits.view(-1, 9), yb.view(-1))
-                    valid = (yb != -100)
-                    n_valid = int(valid.sum().item())
-                    val_loss += float(loss.item()) * n_valid
-                    val_cnt += n_valid
+                    # Explicit masked CE over valid targets
+                    y_flat = yb.view(-1)
+                    lg_flat = masked_logits.view(-1, 9)
+                    valid_mask = (y_flat != -100)
+                    if valid_mask.any():
+                        loss_vec = loss_fn_none(lg_flat[valid_mask], y_flat[valid_mask])
+                        loss = loss_vec.mean()
+                        n_valid = int(valid_mask.sum().item())
+                        val_loss += float(loss.item()) * n_valid
+                        val_cnt += n_valid
                     preds = masked_logits.argmax(dim=-1)  # (N,81)
-                    mask = valid
+                    mask = (yb != -100)
                     val_correct += (preds[mask] == yb[mask]).float().sum().item()
                     val_total_labels += float(mask.sum().item())
         val_acc = (val_correct / val_total_labels) if val_total_labels > 0 else 0.0
