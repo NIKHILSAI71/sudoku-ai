@@ -163,10 +163,9 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
     from sudoku_ai.policy import load_policy, train_toy, train_supervised
     from sudoku_engine import board_to_line as _to_line
 
-    board = _load_board(args.input, args.stdin)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    policy = load_policy(args.ckpt, device=device)
     logger.info("device: %s", device)
+    # We'll load policy after any optional training step
 
     t = Trace(steps=[])
 
@@ -179,8 +178,8 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
                     return False
         return True
 
-    b = board.copy()
-    # Optional on-the-fly training: if requested, run quick supervised training from the input puzzle
+    # Optional on-the-fly training: can run with dataset/puzzles without requiring an input board
+    board: Board | None = None
     if getattr(args, "train", False):
         ckpt = Path(args.ckpt)
         ckpt.parent.mkdir(parents=True, exist_ok=True)
@@ -210,7 +209,22 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
                     seed=42,
                     overfit=False,
                 )
+                # If no puzzle provided, this was a training-only run
+                if args.input is None and args.stdin is None:
+                    policy = load_policy(args.ckpt, device=device)
+                    console.print(f"Training complete. Checkpoint saved -> {ckpt}")
+                    logger.info("training-only run complete -> %s", ckpt)
+                    console.print(f"Log saved -> {log_path}")
+                    return
             else:
+                # Need a board to derive supervised labels from the single input puzzle
+                if args.input is None and args.stdin is None:
+                    msg = "No input puzzle provided. Use -i/--stdin to solve, or pass --dataset/--puzzles with --train for training-only."
+                    console.print(msg, style="red")
+                    logger.error(msg)
+                    console.print(f"Log saved -> {log_path}")
+                    raise SystemExit(2)
+                board = _load_board(args.input, args.stdin)
                 logger.info("supervised training from input: epochs=%d max_samples=%d -> %s", epochs, limit, ckpt)
                 # Write a temporary puzzles file with the single input puzzle line
                 tmp_puzzles = ckpt.parent / "_tmp_puzzles.txt"
@@ -235,6 +249,20 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             logger.exception("supervised training failed; falling back to toy training: %s", e)
             train_toy(epochs=epochs, limit=limit, out_path=str(ckpt))
         policy = load_policy(args.ckpt, device=device)
+    else:
+        # Not training, ensure we have an input board
+        if args.input is None and args.stdin is None:
+            msg = "No input puzzle provided. Use -i/--stdin to solve, or combine with --train and dataset to train."
+            console.print(msg, style="red")
+            logger.error(msg)
+            console.print(f"Log saved -> {log_path}")
+            raise SystemExit(2)
+        board = _load_board(args.input, args.stdin)
+        policy = load_policy(args.ckpt, device=device)
+
+    # At this point we must have a board for solving
+    assert board is not None
+    b = board.copy()
     if not valid_state(b):
         msg = "Unsolvable or contradictory starting board"
         console.print(msg, style="red")
