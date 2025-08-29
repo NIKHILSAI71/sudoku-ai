@@ -237,7 +237,10 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
 def cmd_ai_solve(args: argparse.Namespace) -> None:
     logger, log_path = _init_logger("ai-solve")
-    logger.info("ai-solve start: input=%s ckpt=%s cpu=%s no-prop=%s max-steps=%d", args.input or "<stdin>", args.ckpt, args.cpu, args.no_prop, args.max_steps)
+    logger.info(
+        "ai-solve start: input=%s ckpt=%s cpu=%s no-prop=%s max-steps=%d no-fallback=%s beam-size=%s beam-expand=%s",
+        args.input or "<stdin>", args.ckpt, args.cpu, args.no_prop, args.max_steps, getattr(args, "no_fallback", False), getattr(args, "beam_size", 1), getattr(args, "beam_expand", 30),
+    )
     try:
         import torch  # type: ignore
     except Exception as e:
@@ -281,65 +284,165 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         raise SystemExit(2)
 
     max_steps = args.max_steps
+    no_fallback = getattr(args, "no_fallback", False)
+    beam_size = max(1, int(getattr(args, "beam_size", 1)))
+    beam_expand = max(1, int(getattr(args, "beam_expand", 30)))
     fell_back = False
-    for step in range(max_steps):
-        if b.is_complete():
-            break
-        line = _to_line(b.grid)
-        from sudoku_ai.policy import board_to_tensor as _bt
-        x = _bt(line).unsqueeze(0).to(device)
-        with torch.no_grad():
-            logits = policy(x)
-            probs = torch.softmax(logits, dim=-1)[0]
-        masks = b.candidates_mask()
-        mask_tensor = torch.zeros(81, 9, device=probs.device)
-        for idx in range(81):
-            r, c = divmod(idx, 9)
-            m = int(masks[r, c])
-            if b.grid[r, c] != 0 or m == 0:
-                continue
-            for d in range(1, 10):
-                if m & (1 << (d - 1)):
-                    mask_tensor[idx, d - 1] = 1.0
-        masked = probs * mask_tensor
-        flat_vals = masked.view(-1)
-        values, indices = torch.sort(flat_vals, descending=True)
-        moved = False
-        for rank in range(int(indices.numel())):
-            val = float(values[rank].item())
-            if val <= 0.0:
+    if beam_size <= 1:
+        # Greedy policy (existing behavior)
+        for step in range(max_steps):
+            if b.is_complete():
                 break
-            idx = int(indices[rank].item())
-            cell, dig_idx = divmod(idx, 9)
-            r, c = divmod(cell, 9)
-            d = dig_idx + 1
-            nb = b.copy()
-            nb.set_cell(r, c, d)
-            logger.info("step %d try R%dC%d=%d (score=%.4f)", step + 1, r + 1, c + 1, d, val)
-            if args.trace:
-                t.add("policy", f"R{r+1}C{c+1}={d}")
-            if propagate(nb) is not None:
-                b = nb
-                moved = True
-                logger.info("accepted R%dC%d=%d", r + 1, c + 1, d)
+            line = _to_line(b.grid)
+            from sudoku_ai.policy import board_to_tensor as _bt
+            x = _bt(line).unsqueeze(0).to(device)
+            with torch.no_grad():
+                logits = policy(x)
+                probs = torch.softmax(logits, dim=-1)[0]
+            masks = b.candidates_mask()
+            mask_tensor = torch.zeros(81, 9, device=probs.device)
+            for idx in range(81):
+                r, c = divmod(idx, 9)
+                m = int(masks[r, c])
+                if b.grid[r, c] != 0 or m == 0:
+                    continue
+                for d in range(1, 10):
+                    if m & (1 << (d - 1)):
+                        mask_tensor[idx, d - 1] = 1.0
+            masked = probs * mask_tensor
+            flat_vals = masked.view(-1)
+            values, indices = torch.sort(flat_vals, descending=True)
+            moved = False
+            for rank in range(int(indices.numel())):
+                val = float(values[rank].item())
+                if val <= 0.0:
+                    break
+                idx = int(indices[rank].item())
+                cell, dig_idx = divmod(idx, 9)
+                r, c = divmod(cell, 9)
+                d = dig_idx + 1
+                nb = b.copy()
+                nb.set_cell(r, c, d)
+                logger.info("step %d try R%dC%d=%d (score=%.4f)", step + 1, r + 1, c + 1, d, val)
+                if args.trace:
+                    t.add("policy", f"R{r+1}C{c+1}={d}")
+                if propagate(nb) is not None:
+                    b = nb
+                    moved = True
+                    logger.info("accepted R%dC%d=%d", r + 1, c + 1, d)
+                    break
+                if args.trace:
+                    t.steps[-1] += " (rejected)"
+                logger.info("rejected R%dC%d=%d", r + 1, c + 1, d)
+            if not moved:
+                if no_fallback:
+                    msg = "AI-only policy got stuck (greedy) and --no-fallback set."
+                    console.print(msg, style="red")
+                    logger.error(msg)
+                    console.print(f"Log saved -> {log_path}")
+                    raise SystemExit(1)
+                warn = "AI-only policy got stuck; falling back to backtracking..."
+                console.print(warn, style="yellow")
+                logger.warning(warn)
+                sol_fb = backtracking.solve_one(start_b, stats=stats, trace=(t if args.trace else None), options=opts)
+                if sol_fb is None:
+                    msg = "Fallback backtracking also failed (unsolvable from current state)."
+                    console.print(msg, style="red")
+                    logger.error(msg)
+                    console.print(f"Log saved -> {log_path}")
+                    raise SystemExit(1)
+                b = sol_fb
+                fell_back = True
+                
+                
+                
+                
+                
                 break
-            if args.trace:
-                t.steps[-1] += " (rejected)"
-            logger.info("rejected R%dC%d=%d", r + 1, c + 1, d)
-        if not moved:
-            warn = "AI-only policy got stuck; falling back to backtracking..."
+    else:
+        # Simple beam search guided by policy probabilities
+        try:
+            import torch  # type: ignore # ensure torch in scope for type tools
+        except Exception:
+            pass
+        from math import log
+        class BeamState:
+            __slots__ = ("board", "score")
+            def __init__(self, board: Board, score: float) -> None:
+                self.board = board
+                self.score = score
+
+        beam: list[BeamState] = [BeamState(b, 0.0)]
+        success_state: BeamState | None = None
+        for step in range(max_steps):
+            # Check completion
+            done = [st for st in beam if st.board.is_complete()]
+            if done:
+                success_state = max(done, key=lambda s: s.score)
+                break
+            candidates: list[BeamState] = []
+            for st in beam:
+                line = _to_line(st.board.grid)
+                from sudoku_ai.policy import board_to_tensor as _bt
+                x = _bt(line).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    logits = policy(x)
+                    probs = torch.softmax(logits, dim=-1)[0]
+                masks = st.board.candidates_mask()
+                mask_tensor = torch.zeros(81, 9, device=probs.device)
+                for idx in range(81):
+                    r, c = divmod(idx, 9)
+                    m = int(masks[r, c])
+                    if st.board.grid[r, c] != 0 or m == 0:
+                        continue
+                    for d in range(1, 10):
+                        if m & (1 << (d - 1)):
+                            mask_tensor[idx, d - 1] = 1.0
+                masked = probs * mask_tensor
+                flat_vals = masked.view(-1)
+                k = min(int(flat_vals.numel()), beam_expand)
+                if k <= 0:
+                    continue
+                values, indices = torch.topk(flat_vals, k=k, largest=True)
+                for rnk in range(int(indices.numel())):
+                    val = float(values[rnk].item())
+                    if val <= 0.0:
+                        break
+                    idx = int(indices[rnk].item())
+                    cell, dig_idx = divmod(idx, 9)
+                    r, c = divmod(cell, 9)
+                    d = dig_idx + 1
+                    nb = st.board.copy()
+                    nb.set_cell(r, c, d)
+                    if propagate(nb) is not None:
+                        new_score = st.score + log(max(val, 1e-9))
+                        candidates.append(BeamState(nb, new_score))
+            if not candidates:
+                break
+            # Keep top beam_size candidates
+            candidates.sort(key=lambda s: s.score, reverse=True)
+            beam = candidates[:beam_size]
+        if success_state is not None:
+            b = success_state.board
+        else:
+            if no_fallback:
+                msg = "AI beam-search could not solve within max steps and --no-fallback set."
+                console.print(msg, style="red")
+                logger.error(msg)
+                console.print(f"Log saved -> {log_path}")
+                raise SystemExit(1)
+            warn = "AI beam-search could not solve; falling back to backtracking..."
             console.print(warn, style="yellow")
             logger.warning(warn)
             sol_fb = backtracking.solve_one(start_b, stats=stats, trace=(t if args.trace else None), options=opts)
             if sol_fb is None:
-                msg = "Fallback backtracking also failed (unsolvable from current state)."
+                msg = "Fallback backtracking failed (unsolvable from current state)."
                 console.print(msg, style="red")
                 logger.error(msg)
                 console.print(f"Log saved -> {log_path}")
                 raise SystemExit(1)
             b = sol_fb
             fell_back = True
-            break
 
     if not b.is_complete() and not fell_back:
         logger.warning("AI-only solver reached max steps without completion; falling back to backtracking...")
@@ -477,6 +580,9 @@ def main() -> None:
     ap_ai.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available")
     ap_ai.add_argument("--max-steps", type=int, default=200, help="Max policy steps")
     ap_ai.add_argument("--no-prop", action="store_true", help="Disable heuristic propagation (pure policy mode)")
+    ap_ai.add_argument("--no-fallback", action="store_true", help="Do not fallback to backtracking; error if AI fails")
+    ap_ai.add_argument("--beam-size", type=int, default=1, help="Beam width for AI search (1 = greedy)")
+    ap_ai.add_argument("--beam-expand", type=int, default=30, help="Max expansions per beam state per step")
     ap_ai.add_argument("--no-naked-singles", action="store_true", help="Disable Naked Singles technique during propagation")
     ap_ai.add_argument("--no-hidden-singles", action="store_true", help="Disable Hidden Singles technique during propagation")
     ap_ai.add_argument("--no-pointing-pairs", action="store_true", help="Disable Pointing Pairs technique during propagation")
