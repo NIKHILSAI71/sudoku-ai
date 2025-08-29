@@ -20,7 +20,7 @@ def test_top_level_help_shows_examples_and_aliases():
     assert "solve (slove)" in out
     assert "ai-solve (ai-slove)" in out
 
-    # generator removed
+    # generator/train/eval removed
 
 
 def test_solve_alias_help_usage_and_flags():
@@ -40,15 +40,4 @@ def test_ai_solve_alias_help_usage_and_flags():
     # rate removed
 
 
-def test_eval_help_choices_and_defaults():
-    code, out = run_cli(["eval", "--help"])
-    assert code == 0
-    assert "Evaluate one or more solver backends" in out
-    assert "Backends to evaluate" in out
-
-
-def test_train_help_defaults_and_desc():
-    code, out = run_cli(["train", "--help"])
-    assert code == 0
-    assert "Train a small policy network" in out
-    assert "--epochs" in out
+# train/eval tests removed

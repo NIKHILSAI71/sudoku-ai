@@ -145,101 +145,14 @@ def cmd_solve(args: argparse.Namespace) -> None:
     console.print(f"Log saved -> {log_path}")
 
 
-# difficulty rater removed
-
-
-def cmd_train(args: argparse.Namespace) -> None:
-    # Enable stdout logging for training so progress shows up in notebooks/terminals
-    logger, log_path = _init_logger("train", add_stdout=True)
-    # Back-compat: allow --itr as alias for --epochs
-    if getattr(args, "itr", None) is not None:
-        args.epochs = args.itr
-    logger.info(
-        "train start: epochs=%d limit=%s out=%s dataset=%s puzzles=%s solutions=%s amp=%s",
-        args.epochs,
-        getattr(args, "limit", None),
-        args.out,
-        getattr(args, "dataset", None),
-        getattr(args, "puzzles", None),
-        getattr(args, "solutions", None),
-        getattr(args, "amp", False),
-    )
-    from sudoku_ai.policy import train_toy, train_supervised
-
-    ckpt = Path(args.out)
-    ckpt.parent.mkdir(parents=True, exist_ok=True)
-
-    def _progress(ep: int, loss: float, acc: float) -> None:
-        logger.info("epoch %d: loss=%.6f acc=%.4f", ep, loss, acc)
-
-    # If a dataset path (that exists) or puzzles file is provided, run supervised; otherwise run toy
-    ds_arg = getattr(args, "dataset", None)
-    puzzles_arg = getattr(args, "puzzles", None)
-    ds_exists = False
-    puzzles_exists = False
-    try:
-        ds_exists = bool(ds_arg) and Path(ds_arg).exists()
-    except Exception:
-        ds_exists = False
-    try:
-        puzzles_exists = bool(puzzles_arg) and Path(puzzles_arg).exists()
-    except Exception:
-        puzzles_exists = False
-    if ds_exists or puzzles_exists:
-        _ = train_supervised(
-            out_path=str(ckpt),
-            dataset_jsonl=getattr(args, "dataset", None),
-            puzzles_path=getattr(args, "puzzles", None),
-            solutions_path=getattr(args, "solutions", None),
-            epochs=args.epochs,
-            batch_size=getattr(args, "batch_size", 64),
-            lr=getattr(args, "lr", 1e-3),
-            val_split=getattr(args, "val_split", 0.1),
-            max_samples=getattr(args, "limit", None),
-            augment=not getattr(args, "no_augment", False),
-            amp=getattr(args, "amp", False),
-            seed=getattr(args, "seed", 42),
-            overfit=getattr(args, "overfit", False),
-            overfit_size=getattr(args, "overfit_size", 512),
-            min_loss_to_stop=getattr(args, "min_loss_to_stop", 5e-7),
-            min_acc_to_stop=getattr(args, "min_acc_to_stop", 0.99999),
-            progress_cb=_progress,
-        )
-    else:
-        train_toy(epochs=args.epochs, limit=args.limit, out_path=str(ckpt), progress_cb=_progress)
-
-    msg = f"Saved checkpoint -> {ckpt}"
-    console.print(msg)
-    logger.info(msg)
-    logger.info("train end")
-    console.print(f"Log saved -> {log_path}")
-
-
-def cmd_eval(args: argparse.Namespace) -> None:
-    path = Path(args.input)
-    lines = path.read_text(encoding="utf-8").splitlines()
-    table = Table(title="Eval")
-    table.add_column("idx")
-    table.add_column("backend")
-    table.add_column("ok")
-    for i, ln in enumerate(lines[: args.limit]):
-        rec = json.loads(ln)
-        board = Board(parse_line(rec["puzzle"]))
-        for backend in args.backends:
-            if backend == "dlx":
-                sol = dlx.solve_one(board)
-            else:
-                sol = backtracking.solve_one(board)
-            ok = sol is not None
-            table.add_row(str(i), backend, "1" if ok else "0")
-    console.print(table)
+# commands removed: rater, train, eval
 
 
 def cmd_ai_solve(args: argparse.Namespace) -> None:
     logger, log_path = _init_logger("ai-solve")
     logger.info(
-        "ai-solve start: input=%s ckpt=%s cpu=%s no-prop=%s max-steps=%d no-fallback=%s beam-size=%s beam-expand=%s",
-        args.input or "<stdin>", args.ckpt, args.cpu, args.no_prop, args.max_steps, getattr(args, "no_fallback", False), getattr(args, "beam_size", 1), getattr(args, "beam_expand", 30),
+    "ai-solve start: input=%s ckpt=%s cpu=%s max-steps=%d train=%s temperature=%.3f",
+    args.input or "<stdin>", args.ckpt, args.cpu, args.max_steps, getattr(args, "train", False), float(getattr(args, "temperature", 1.0)),
     )
     try:
         import torch  # type: ignore
@@ -247,7 +160,7 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         console.print("PyTorch is required for ai-solve. Please install torch.", style="red")
         logger.exception("torch import failed")
         raise SystemExit(3)
-    from sudoku_ai.policy import load_policy
+    from sudoku_ai.policy import load_policy, train_toy
     from sudoku_engine import board_to_line as _to_line
 
     board = _load_board(args.input, args.stdin)
@@ -256,27 +169,27 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
     logger.info("device: %s", device)
 
     t = Trace(steps=[])
-    stats = backtracking.Stats()
-    opts = _options_from_args(args)
 
-    def propagate(b: Board) -> Board | None:
-        if args.no_prop:
-            masks = b.candidates_mask()
-            for r in range(9):
-                for c in range(9):
-                    if b.grid[r, c] == 0 and int(masks[r, c]) == 0:
-                        return None
-            return b
-        else:
-            masks = backtracking._propagate(b, trace=t if args.trace else None, hstats=stats.heuristics, options=opts)
-            if masks is None:
-                return None
-            return b
+    def valid_state(b: Board) -> bool:
+        # Minimal consistency: every empty cell must have at least one legal candidate
+        masks = b.candidates_mask()
+        for r in range(9):
+            for c in range(9):
+                if b.grid[r, c] == 0 and int(masks[r, c]) == 0:
+                    return False
+        return True
 
     b = board.copy()
-    # keep a pristine copy for fallback
-    start_b = b.copy()
-    if propagate(b) is None:
+    # Optional on-the-fly training: if requested, (re)train a tiny policy before solving
+    if getattr(args, "train", False):
+        ckpt = Path(args.ckpt)
+        ckpt.parent.mkdir(parents=True, exist_ok=True)
+        epochs = int(getattr(args, "train_epochs", 1))
+        limit = int(getattr(args, "train_limit", 500))
+        logger.info("training policy: epochs=%d limit=%d -> %s", epochs, limit, ckpt)
+        train_toy(epochs=epochs, limit=limit, out_path=str(ckpt))
+        policy = load_policy(args.ckpt, device=device)
+    if not valid_state(b):
         msg = "Unsolvable or contradictory starting board"
         console.print(msg, style="red")
         logger.error(msg)
@@ -284,178 +197,77 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         raise SystemExit(2)
 
     max_steps = args.max_steps
-    no_fallback = getattr(args, "no_fallback", False)
-    beam_size = max(1, int(getattr(args, "beam_size", 1)))
-    beam_expand = max(1, int(getattr(args, "beam_expand", 30)))
-    fell_back = False
-    if beam_size <= 1:
-        # Greedy policy (existing behavior)
-        for step in range(max_steps):
-            if b.is_complete():
-                break
-            line = _to_line(b.grid)
-            from sudoku_ai.policy import board_to_tensor as _bt
-            x = _bt(line).unsqueeze(0).to(device)
-            with torch.no_grad():
-                logits = policy(x)
-                probs = torch.softmax(logits, dim=-1)[0]
-            masks = b.candidates_mask()
-            mask_tensor = torch.zeros(81, 9, device=probs.device)
-            for idx in range(81):
-                r, c = divmod(idx, 9)
-                m = int(masks[r, c])
-                if b.grid[r, c] != 0 or m == 0:
-                    continue
-                for d in range(1, 10):
-                    if m & (1 << (d - 1)):
-                        mask_tensor[idx, d - 1] = 1.0
-            masked = probs * mask_tensor
-            flat_vals = masked.view(-1)
-            values, indices = torch.sort(flat_vals, descending=True)
-            moved = False
-            for rank in range(int(indices.numel())):
-                val = float(values[rank].item())
-                if val <= 0.0:
-                    break
-                idx = int(indices[rank].item())
-                cell, dig_idx = divmod(idx, 9)
-                r, c = divmod(cell, 9)
-                d = dig_idx + 1
-                nb = b.copy()
-                nb.set_cell(r, c, d)
-                logger.info("step %d try R%dC%d=%d (score=%.4f)", step + 1, r + 1, c + 1, d, val)
-                if args.trace:
-                    t.add("policy", f"R{r+1}C{c+1}={d}")
-                if propagate(nb) is not None:
-                    b = nb
-                    moved = True
-                    logger.info("accepted R%dC%d=%d", r + 1, c + 1, d)
-                    break
-                if args.trace:
-                    t.steps[-1] += " (rejected)"
-                logger.info("rejected R%dC%d=%d", r + 1, c + 1, d)
-            if not moved:
-                if no_fallback:
-                    msg = "AI-only policy got stuck (greedy) and --no-fallback set."
-                    console.print(msg, style="red")
-                    logger.error(msg)
-                    console.print(f"Log saved -> {log_path}")
-                    raise SystemExit(1)
-                warn = "AI-only policy got stuck; falling back to backtracking..."
-                console.print(warn, style="yellow")
-                logger.warning(warn)
-                sol_fb = backtracking.solve_one(start_b, stats=stats, trace=(t if args.trace else None), options=opts)
-                if sol_fb is None:
-                    msg = "Fallback backtracking also failed (unsolvable from current state)."
-                    console.print(msg, style="red")
-                    logger.error(msg)
-                    console.print(f"Log saved -> {log_path}")
-                    raise SystemExit(1)
-                b = sol_fb
-                fell_back = True
-                
-                
-                
-                
-                
-                break
-    else:
-        # Simple beam search guided by policy probabilities
-        try:
-            import torch  # type: ignore # ensure torch in scope for type tools
-        except Exception:
-            pass
-        from math import log
-        class BeamState:
-            __slots__ = ("board", "score")
-            def __init__(self, board: Board, score: float) -> None:
-                self.board = board
-                self.score = score
-
-        beam: list[BeamState] = [BeamState(b, 0.0)]
-        success_state: BeamState | None = None
-        for step in range(max_steps):
-            # Check completion
-            done = [st for st in beam if st.board.is_complete()]
-            if done:
-                success_state = max(done, key=lambda s: s.score)
-                break
-            candidates: list[BeamState] = []
-            for st in beam:
-                line = _to_line(st.board.grid)
-                from sudoku_ai.policy import board_to_tensor as _bt
-                x = _bt(line).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    logits = policy(x)
-                    probs = torch.softmax(logits, dim=-1)[0]
-                masks = st.board.candidates_mask()
-                mask_tensor = torch.zeros(81, 9, device=probs.device)
-                for idx in range(81):
-                    r, c = divmod(idx, 9)
-                    m = int(masks[r, c])
-                    if st.board.grid[r, c] != 0 or m == 0:
-                        continue
-                    for d in range(1, 10):
-                        if m & (1 << (d - 1)):
-                            mask_tensor[idx, d - 1] = 1.0
-                masked = probs * mask_tensor
-                flat_vals = masked.view(-1)
-                k = min(int(flat_vals.numel()), beam_expand)
-                if k <= 0:
-                    continue
-                values, indices = torch.topk(flat_vals, k=k, largest=True)
-                for rnk in range(int(indices.numel())):
-                    val = float(values[rnk].item())
-                    if val <= 0.0:
-                        break
-                    idx = int(indices[rnk].item())
-                    cell, dig_idx = divmod(idx, 9)
-                    r, c = divmod(cell, 9)
-                    d = dig_idx + 1
-                    nb = st.board.copy()
-                    nb.set_cell(r, c, d)
-                    if propagate(nb) is not None:
-                        new_score = st.score + log(max(val, 1e-9))
-                        candidates.append(BeamState(nb, new_score))
-            if not candidates:
-                break
-            # Keep top beam_size candidates
-            candidates.sort(key=lambda s: s.score, reverse=True)
-            beam = candidates[:beam_size]
-        if success_state is not None:
-            b = success_state.board
-        else:
-            if no_fallback:
-                msg = "AI beam-search could not solve within max steps and --no-fallback set."
-                console.print(msg, style="red")
-                logger.error(msg)
-                console.print(f"Log saved -> {log_path}")
-                raise SystemExit(1)
-            warn = "AI beam-search could not solve; falling back to backtracking..."
-            console.print(warn, style="yellow")
-            logger.warning(warn)
-            sol_fb = backtracking.solve_one(start_b, stats=stats, trace=(t if args.trace else None), options=opts)
-            if sol_fb is None:
-                msg = "Fallback backtracking failed (unsolvable from current state)."
-                console.print(msg, style="red")
-                logger.error(msg)
-                console.print(f"Log saved -> {log_path}")
-                raise SystemExit(1)
-            b = sol_fb
-            fell_back = True
-
-    if not b.is_complete() and not fell_back:
-        logger.warning("AI-only solver reached max steps without completion; falling back to backtracking...")
-        console.print("AI-only solver reached max steps; falling back to backtracking...", style="yellow")
-        sol_fb = backtracking.solve_one(start_b, stats=stats, trace=(t if args.trace else None), options=opts)
-        if sol_fb is None:
-            msg = "Fallback backtracking failed (unsolvable from current state)."
+    # Pure policy sampling loop (no greedy, no propagation)
+    temperature = max(1e-6, float(getattr(args, "temperature", 1.0)))
+    for step in range(max_steps):
+        if b.is_complete():
+            break
+        line = _to_line(b.grid)
+        from sudoku_ai.policy import board_to_tensor as _bt
+        x = _bt(line).unsqueeze(0).to(device)
+        with torch.no_grad():
+            logits = policy(x)[0]
+            # Temperature scaling
+            logits = logits / temperature
+            probs = torch.softmax(logits, dim=-1)
+        masks = b.candidates_mask()
+        mask_tensor = torch.zeros(81, 9, device=probs.device)
+        for idx in range(81):
+            r, c = divmod(idx, 9)
+            m = int(masks[r, c])
+            if b.grid[r, c] != 0 or m == 0:
+                continue
+            for d in range(1, 10):
+                if m & (1 << (d - 1)):
+                    mask_tensor[idx, d - 1] = 1.0
+        masked = probs * mask_tensor
+        flat = masked.view(-1)
+        total = float(flat.sum().item())
+        if total <= 0.0:
+            msg = "AI sampling has no legal moves (dead state)."
             console.print(msg, style="red")
             logger.error(msg)
             console.print(f"Log saved -> {log_path}")
             raise SystemExit(1)
-        b = sol_fb
+        # Resample until a valid move is found or distribution exhausted
+        moved = False
+        while True:
+            dist = flat / flat.sum()
+            choice = int(torch.multinomial(dist, num_samples=1).item())
+            cell, dig_idx = divmod(choice, 9)
+            r, c = divmod(cell, 9)
+            d = dig_idx + 1
+            nb = b.copy()
+            nb.set_cell(r, c, d)
+            if valid_state(nb):
+                b = nb
+                if args.trace:
+                    t.add("policy", f"R{r+1}C{c+1}={d}")
+                logger.info("accepted R%dC%d=%d", r + 1, c + 1, d)
+                moved = True
+                break
+            # zero out invalid choice and try again
+            flat[choice] = 0.0
+            if float(flat.sum().item()) <= 0.0:
+                if args.trace:
+                    t.add("policy", f"R{r+1}C{c+1}={d} (rejected)")
+                logger.info("no valid moves remain after rejections at step %d", step + 1)
+                break
+        if not moved:
+            msg = "AI sampling exhausted without a valid move."
+            console.print(msg, style="red")
+            logger.error(msg)
+            console.print(f"Log saved -> {log_path}")
+            raise SystemExit(1)
 
+    # No final fallback; AI must have completed by here or exited
+
+    if not b.is_complete():
+        msg = "AI did not complete within max-steps."
+        console.print(msg, style="red")
+        logger.error(msg)
+        console.print(f"Log saved -> {log_path}")
+        raise SystemExit(1)
     line = board_to_line(b.grid)
     console.print(line)
     logger.info("solution: %s", line)
@@ -479,15 +291,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         prog="sudoku",
         description=(
-        "Sudoku toolkit: solve, evaluate, and AI-solve puzzles.\n\n"
+        "Sudoku toolkit: solve with engine or AI.\n\n"
         "Common examples:\n"
         "  sudoku solve -i examples/easy1.sdk --pretty\n"
-        "  sudoku eval -i data.jsonl -l 100 -b dlx backtracking\n"
-        "  sudoku ai-solve -i examples/easy1.sdk --ckpt checkpoints/policy.pt\n"
+    "  sudoku ai-solve -i examples/easy1.sdk --ckpt checkpoints/policy.pt\n"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    sub = ap.add_subparsers(dest="cmd", required=True, metavar="{solve,train,eval,ai-solve}")
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="{solve,ai-solve}")
 
     ap_solve = sub.add_parser(
         "solve",
@@ -520,78 +331,28 @@ def main() -> None:
     ap_solve.add_argument("--pretty", action="store_true", help="Pretty-print the solved grid as a 9x9 board")
     ap_solve.set_defaults(func=cmd_solve)
 
-    # rate subcommand removed
-
-    ap_train = sub.add_parser(
-        "train",
-        help="train learning agent (toy)",
-        description="Train a small policy network on synthetic boards (toy example).",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    ap_train.add_argument("--epochs", type=int, default=1, help="Number of training epochs")
-    # Deprecated alias for legacy scripts; maps to --epochs if provided
-    ap_train.add_argument("--itr", type=int, help="Deprecated alias for --epochs")
-    ap_train.add_argument("--limit", type=int, default=500, help="Max samples (toy or supervised)")
-    ap_train.add_argument("--out", type=str, default="checkpoints/policy.pt", help="Where to save the checkpoint")
-    # Supervised options (optional)
-    ap_train.add_argument("--dataset", type=str, default=None, help="Path to JSONL dataset with fields 'puzzle' and optional 'solution'")
-    ap_train.add_argument("--puzzles", type=str, default=None, help="Path to file with puzzles, one per line")
-    ap_train.add_argument("--solutions", type=str, default=None, help="Optional solutions file aligned with --puzzles")
-    ap_train.add_argument("--batch-size", type=int, default=64, help="Batch size for supervised training")
-    ap_train.add_argument("--lr", type=float, default=3e-4, help="Learning rate for supervised training")
-    ap_train.add_argument("--val-split", type=float, default=0.1, help="Validation split fraction")
-    ap_train.add_argument("--seed", type=int, default=42, help="Random seed")
-    ap_train.add_argument("--no-augment", action="store_true", help="Disable data augmentation")
-    ap_train.add_argument("--amp", action="store_true", help="Enable mixed precision (AMP)")
-    ap_train.add_argument("--overfit", action="store_true", help="Overfit a tiny subset to drive ~100% train acc")
-    ap_train.add_argument("--overfit-size", type=int, default=512, help="Subset size for --overfit mode")
-    ap_train.add_argument("--min-loss-to-stop", type=float, default=5e-7, help="Early stop when train loss <= this (no val)")
-    ap_train.add_argument("--min-acc-to-stop", type=float, default=0.99999, help="Early stop when train acc >= this (no val)")
-    ap_train.set_defaults(func=cmd_train)
-
-    ap_eval = sub.add_parser(
-        "eval",
-        help="evaluate backends on dataset",
-        description="Evaluate one or more solver backends on an input JSONL dataset.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    ap_eval.add_argument("-i", "--input", type=str, required=True, help="Path to JSONL with records containing 'puzzle'")
-    ap_eval.add_argument("-l", "--limit", type=int, default=50, help="Max number of puzzles to evaluate")
-    ap_eval.add_argument(
-        "-b",
-        "--backends",
-        nargs="+",
-        default=["dlx", "backtracking"],
-        choices=["dlx", "backtracking"],
-        help="Backends to evaluate",
-    )
-    ap_eval.set_defaults(func=cmd_eval)
+    # train/eval subcommands removed
 
     ap_ai = sub.add_parser(
         "ai-solve",
         aliases=["ai-slove"],
         help="solve puzzle using a policy checkpoint",
-        description="Solve a Sudoku using a trained policy; optionally combine with light propagation.",
+    description="Solve a Sudoku using a trained policy (no propagation).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap_ai.add_argument("-i", "--input", type=str, default=None, help="Path to input puzzle (single-line .sdk format)")
     ap_ai.add_argument("--stdin", type=str, default=None, help="Read puzzle from the provided string instead of a file")
     ap_ai.add_argument("--ckpt", type=str, default="checkpoints/policy.pt", help="Path to policy checkpoint (.pt)")
     ap_ai.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available")
-    ap_ai.add_argument("--max-steps", type=int, default=200, help="Max policy steps")
-    ap_ai.add_argument("--no-prop", action="store_true", help="Disable heuristic propagation (pure policy mode)")
-    ap_ai.add_argument("--no-fallback", action="store_true", help="Do not fallback to backtracking; error if AI fails")
-    ap_ai.add_argument("--beam-size", type=int, default=1, help="Beam width for AI search (1 = greedy)")
-    ap_ai.add_argument("--beam-expand", type=int, default=30, help="Max expansions per beam state per step")
-    ap_ai.add_argument("--no-naked-singles", action="store_true", help="Disable Naked Singles technique during propagation")
-    ap_ai.add_argument("--no-hidden-singles", action="store_true", help="Disable Hidden Singles technique during propagation")
-    ap_ai.add_argument("--no-pointing-pairs", action="store_true", help="Disable Pointing Pairs technique during propagation")
-    ap_ai.add_argument("--no-naked-pairs", action="store_true", help="Disable Naked Pairs technique during propagation")
-    ap_ai.add_argument("--no-hidden-pairs", action="store_true", help="Disable Hidden Pairs technique during propagation")
-    ap_ai.add_argument("--no-hidden-triples", action="store_true", help="Disable Hidden Triples technique during propagation")
-    ap_ai.add_argument("--no-x-wing", action="store_true", help="Disable X-Wing technique during propagation")
+    ap_ai.add_argument("--max-steps", type=int, default=1000, help="Max policy steps")
+    ap_ai.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature (>1 more random, <1 sharper)")
+    # On-the-fly training flags
+    ap_ai.add_argument("--train", action="store_true", help="Train a tiny policy before solving (toy)")
+    ap_ai.add_argument("--train-epochs", type=int, default=1, help="Epochs for on-the-fly training")
+    ap_ai.add_argument("--train-limit", type=int, default=500, help="Samples limit for on-the-fly training")
+    # Propagation flags removed for AI-only mode
     ap_ai.add_argument("--pretty", action="store_true", help="Pretty-print the final grid as a 9x9 board")
-    ap_ai.add_argument("--trace", action="store_true", help="Log AI move attempts and propagation steps")
+    ap_ai.add_argument("--trace", action="store_true", help="Log AI sampling decisions")
     ap_ai.set_defaults(func=cmd_ai_solve)
 
     args = ap.parse_args()
