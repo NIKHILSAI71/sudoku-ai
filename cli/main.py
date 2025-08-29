@@ -199,8 +199,31 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         dataset = _norm_path(getattr(args, "dataset", None))
         puzzles_path = _norm_path(getattr(args, "puzzles", None))
         solutions_path = _norm_path(getattr(args, "solutions", None))
+        # Pre-validate input files for a friendlier error than deep stack traces
+        if dataset is not None:
+            ds_path = Path(dataset)
+            if not ds_path.exists():
+                msg = f"Dataset file not found: {ds_path}. Provide a valid --dataset or use --puzzles."
+                console.print(msg, style="red")
+                logger.error(msg)
+                console.print(f"Log saved -> {log_path}")
+                raise SystemExit(2)
+        if puzzles_path is not None:
+            pz_path = Path(puzzles_path)
+            if not pz_path.exists():
+                msg = f"Puzzles file not found: {pz_path}. Provide a valid --puzzles or use --dataset."
+                console.print(msg, style="red")
+                logger.error(msg)
+                console.print(f"Log saved -> {log_path}")
+                raise SystemExit(2)
+        if solutions_path is not None:
+            sol_path = Path(solutions_path)
+            if not sol_path.exists():
+                # Not fatal: we'll let supervised training solve puzzles if needed
+                logger.warning("Solutions file not found: %s (will generate solutions automatically)", sol_path)
+                solutions_path = None
         try:
-            if dataset or puzzles_path:
+            if (dataset is not None) or (puzzles_path is not None):
                 logger.info(
                     "supervised training from dataset: epochs=%d max_samples=%d dataset=%s puzzles=%s solutions=%s -> %s",
                     epochs, limit, dataset, puzzles_path, solutions_path, ckpt,
