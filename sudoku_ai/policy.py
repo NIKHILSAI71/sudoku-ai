@@ -370,10 +370,10 @@ def train_supervised(
                 preds = masked_logits.argmax(dim=-1)  # (B,81)
                 mask = (yb != -100)
                 train_correct += (preds[mask] == yb[mask]).float().sum().item()
-        train_total_labels += float(mask.sum().item())
-    sched.step()
-    train_loss = total_loss / max(1, total_cnt)
-    train_acc = (train_correct / train_total_labels) if train_total_labels > 0 else 0.0
+                train_total_labels += float(mask.sum().item())
+            sched.step()
+            train_loss = total_loss / max(1, total_cnt)
+            train_acc = (train_correct / train_total_labels) if train_total_labels > 0 else 0.0
 
         # Validation
         val_loss = 0.0
