@@ -125,16 +125,18 @@ class SimplePolicyNet(nn.Module):
     - A few conv layers with residual connections, then a head to 81*9 logits
     """
 
-    def __init__(self, width: int = 64) -> None:
+    def __init__(self, width: int = 64, drop: float = 0.2) -> None:
         super().__init__()
         c = width
         self.backbone = nn.Sequential(
             nn.Conv2d(10, c, kernel_size=3, padding=1),
             nn.BatchNorm2d(c),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(p=drop),
             nn.Conv2d(c, c, kernel_size=3, padding=1),
             nn.BatchNorm2d(c),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(p=drop),
             nn.Conv2d(c, c, kernel_size=3, padding=1),
             nn.BatchNorm2d(c),
             nn.ReLU(inplace=True),
@@ -143,6 +145,7 @@ class SimplePolicyNet(nn.Module):
             nn.Flatten(),
             nn.Linear(c * 9 * 9, 512),
             nn.ReLU(inplace=True),
+            nn.Dropout(p=drop),
             nn.Linear(512, 81 * 9),
         )
 
@@ -301,9 +304,13 @@ def train_supervised(
 
     # 5) Model/optim/loss
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SimplePolicyNet(width=64).to(device)
-    opt = optim.AdamW(model.parameters(), lr=float(lr))
-    criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    model = SimplePolicyNet(width=64, drop=0.2).to(device)
+    opt = optim.AdamW(model.parameters(), lr=float(lr), weight_decay=0.02)
+    # Use label smoothing when available; fall back silently if unsupported
+    try:
+        criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.05)
+    except TypeError:
+        criterion = nn.CrossEntropyLoss(ignore_index=-100)
     scaler = torch.cuda.amp.GradScaler(enabled=bool(amp) and device.type == "cuda")
 
     history: Dict[str, List[float]] = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
