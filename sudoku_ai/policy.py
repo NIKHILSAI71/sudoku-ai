@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional, Callable, List, Dict, Any, Tuple
 import logging
 from pathlib import Path
+import os
 
 import torch
 import torch.nn as nn
@@ -407,15 +408,17 @@ def train_supervised(
         )
 
     return {"best_val": float(best_val), "best_epoch": int(best_epoch), "history": history}
-
-
-def load_policy(ckpt_path: str, device: Optional[torch.device] = None) -> nn.Module:
+def load_policy(
+    ckpt_path: str,
+    device: Optional[torch.device] = None,
+    *,
+    allow_oracle_fallback: bool = True,
+) -> nn.Module:
     """Load a policy checkpoint.
 
     - If arch == 'oracle' (or missing), return OraclePolicy.
     - Otherwise, default to OraclePolicy for robustness.
     """
-    _ = device  # unused; kept for signature compatibility
     state = torch.load(ckpt_path, map_location='cpu')
     arch = state.get("arch") if isinstance(state, dict) else None
     if arch == "cnn_v1" and isinstance(state, dict) and "model_state" in state:
@@ -425,6 +428,10 @@ def load_policy(ckpt_path: str, device: Optional[torch.device] = None) -> nn.Mod
             model.to(device)
         model.eval()
         return model
+    # Strict mode: disallow fallback to OraclePolicy
+    strict_env = os.getenv("SUDOKU_POLICY_STRICT", "").strip() == "1"
+    if strict_env or not allow_oracle_fallback:
+        raise RuntimeError("Non-cnn_v1 checkpoint; strict mode forbids Oracle fallback (DLX-backed).")
     # Default/fallback: deterministic oracle (keeps CLI/tests robust)
     model = OraclePolicy()
     if device is not None:
