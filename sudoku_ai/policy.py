@@ -60,29 +60,36 @@ class SmallPolicy(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, dropout_p: float = 0.1) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
+        self.drop = nn.Dropout2d(p=dropout_p)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
 
+        # Initialize with Kaiming for ReLU stability
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = F.relu(self.bn1(self.conv1(x)))
+        out = self.drop(out)
         out = self.bn2(self.conv2(out))
         out = F.relu(out + x)
         return out
 
 
 class ResNetPolicy(nn.Module):
-    def __init__(self, channels: int = 256, depth: int = 20) -> None:
+    def __init__(self, channels: int = 256, depth: int = 20, dropout_p: float = 0.1) -> None:
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(10, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
         )
-        self.blocks = nn.Sequential(*[ResidualBlock(channels) for _ in range(depth)])
+        self.blocks = nn.Sequential(*[ResidualBlock(channels, dropout_p=dropout_p) for _ in range(depth)])
         self.head = nn.Sequential(
             nn.Conv2d(channels, 9, 1, bias=True),
         )
@@ -303,7 +310,15 @@ def train_supervised(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ResNetPolicy().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, epochs))
+    # Scheduler: use ReduceLROnPlateau driven by validation loss when available;
+    # fall back to a simple per-epoch cosine schedule when no validation split.
+    use_plateau = (val_split > 0.0)
+    if use_plateau:
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode='min', factor=0.5, patience=2, min_lr=1e-6, verbose=False
+        )
+    else:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, epochs))
     # AMP: prefer torch.amp API with fallback for older torch
     try:
         scaler = torch.amp.GradScaler('cuda', enabled=amp)
@@ -311,14 +326,59 @@ def train_supervised(
     except Exception:
         scaler = torch.cuda.amp.GradScaler(enabled=amp)
         autocast_cm = lambda: torch.cuda.amp.autocast(enabled=amp)
-    # We'll compute CE on only valid targets explicitly (no ignore_index/label_smoothing)
-    # to avoid pathological interactions and allow zero minimum loss.
-    loss_fn_none = nn.CrossEntropyLoss(reduction='none')
+    # Loss settings
+    label_smoothing = 0.05
+
+    def _masked_loss_and_acc(logits: torch.Tensor, targets: torch.Tensor, legal_mask: torch.Tensor) -> Tuple[torch.Tensor, float, int]:
+        """Compute label-smoothed CE over only valid positions and legal digits.
+        Returns: (loss_tensor, correct_count, total_count)
+        """
+        # Mask out illegal digits prior to softmax
+        masked_logits = logits.masked_fill(legal_mask == 0, -1e9)
+        y_flat = targets.view(-1)
+        lg_flat = masked_logits.view(-1, 9)
+        m_flat = legal_mask.view(-1, 9)
+        valid = (y_flat != -100)
+        if not valid.any():
+            zero = lg_flat.sum() * 0.0
+            return zero, 0.0, 0
+        idxs = torch.nonzero(valid, as_tuple=False).squeeze(1)
+        yv = y_flat[idxs]
+        lv = lg_flat[idxs]
+        mv = m_flat[idxs]
+        # Ensure GT digit is legal
+        mv.scatter_(1, yv.unsqueeze(1), 1.0)
+        # Compute log-probs over legal digits
+        lv = lv.masked_fill(mv == 0, -1e9)
+        logp = F.log_softmax(lv, dim=-1)
+        # Label smoothing across only legal digits
+        if label_smoothing > 0.0:
+            with torch.no_grad():
+                k = mv.sum(dim=-1)  # number of legal digits per row
+                # base mass over non-true legal digits
+                denom = torch.clamp(k - 1.0, min=1.0)
+                base = (label_smoothing / denom).unsqueeze(1)
+                q = base * mv
+                q.scatter_(1, yv.unsqueeze(1), 1.0 - label_smoothing)
+        else:
+            q = torch.zeros_like(logp)
+            q.scatter_(1, yv.unsqueeze(1), 1.0)
+        ce = -(q * logp).sum(dim=-1).mean()
+        # Accuracy on valid positions
+        with torch.no_grad():
+            preds = lv.argmax(dim=-1)
+            correct = (preds == yv).float().sum().item()
+            total = int(yv.numel())
+        return ce, correct, total
 
     def _loader(ds: Dataset, shuffle: bool) -> DataLoader:
         return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=0, generator=g)
 
     best_val = float('inf')
+    best_epoch = 0
+    # Early stopping on validation when present
+    es_patience = 5
+    es_counter = 0
     history: Dict[str, List[float]] = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
 
     for ep in range(1, epochs + 1):
@@ -333,24 +393,7 @@ def train_supervised(
             mb = mb.to(device)
             with autocast_cm():
                 logits = model(xb)
-                # Ensure ground-truth digit is legal (in case of degenerate masks)
-                with torch.no_grad():
-                    y_flat = yb.view(-1)
-                    m_flat = mb.view(-1, 9)
-                    valid_pos = (y_flat >= 0)
-                    if valid_pos.any():
-                        idxs = torch.nonzero(valid_pos, as_tuple=False).squeeze(1)
-                        m_flat[idxs, y_flat[valid_pos]] = 1.0
-                masked_logits = logits.masked_fill(mb == 0, -1e9)
-                # Compute loss only on positions with a real target
-                y_flat = yb.view(-1)
-                lg_flat = masked_logits.view(-1, 9)
-                valid_mask = (y_flat != -100)
-                if valid_mask.any():
-                    loss_vec = loss_fn_none(lg_flat[valid_mask], y_flat[valid_mask])
-                    loss = loss_vec.mean()
-                else:
-                    loss = lg_flat.sum() * 0.0  # zero, keeps graph/device
+            loss, correct, total = _masked_loss_and_acc(logits, yb, mb)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             # Gradient clipping for stability
@@ -359,19 +402,11 @@ def train_supervised(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(opt)
             scaler.update()
-            # Count only non-ignored labels for averaging
-            with torch.no_grad():
-                valid = (yb != -100)
-                n_valid = int(valid.sum().item())
-            total_loss += float(loss.item()) * n_valid
-            total_cnt += n_valid
-            # Train accuracy on non-masked labels
-            with torch.no_grad():
-                preds = masked_logits.argmax(dim=-1)  # (B,81)
-                mask = (yb != -100)
-                train_correct += (preds[mask] == yb[mask]).float().sum().item()
-                train_total_labels += float(mask.sum().item())
-            sched.step()
+            # Accumulate metrics
+            total_loss += float(loss.item()) * total
+            total_cnt += total
+            train_correct += float(correct)
+            train_total_labels += float(total)
             train_loss = total_loss / max(1, total_cnt)
             train_acc = (train_correct / train_total_labels) if train_total_labels > 0 else 0.0
 
@@ -389,21 +424,11 @@ def train_supervised(
                     mb = mb.to(device)
                     with autocast_cm():
                         logits = model(xb)
-                        masked_logits = logits.masked_fill(mb == 0, -1e9)
-                    # Explicit masked CE over valid targets
-                    y_flat = yb.view(-1)
-                    lg_flat = masked_logits.view(-1, 9)
-                    valid_mask = (y_flat != -100)
-                    if valid_mask.any():
-                        loss_vec = loss_fn_none(lg_flat[valid_mask], y_flat[valid_mask])
-                        loss = loss_vec.mean()
-                        n_valid = int(valid_mask.sum().item())
-                        val_loss += float(loss.item()) * n_valid
-                        val_cnt += n_valid
-                    preds = masked_logits.argmax(dim=-1)  # (N,81)
-                    mask = (yb != -100)
-                    val_correct += (preds[mask] == yb[mask]).float().sum().item()
-                    val_total_labels += float(mask.sum().item())
+                        loss_v, correct_v, total_v = _masked_loss_and_acc(logits, yb, mb)
+                    val_loss += float(loss_v.item()) * total_v
+                    val_cnt += total_v
+                    val_correct += float(correct_v)
+                    val_total_labels += float(total_v)
         val_acc = (val_correct / val_total_labels) if val_total_labels > 0 else 0.0
         val_loss = val_loss / max(1, val_cnt)
 
@@ -420,6 +445,7 @@ def train_supervised(
         cur_val = val_loss if val_cnt > 0 else train_loss
         if cur_val < best_val:
             best_val = cur_val
+            best_epoch = ep
             torch.save({
                 "arch": "resnet",
                 "model": model.state_dict(),
@@ -429,12 +455,29 @@ def train_supervised(
                     "val_split": val_split,
                 },
             }, out_path)
+            es_counter = 0
+        else:
+            # Count epochs without improvement (only when validation available)
+            if val_cnt > 0:
+                es_counter += 1
+
+        # Step scheduler per-epoch (ReduceLROnPlateau needs the metric; cosine is stepped blindly)
+        try:
+            if isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                sched.step(cur_val)
+            else:
+                sched.step()
+        except Exception:
+            pass
 
         # Early stop for overfit mode (and when no validation): drive to zero loss and perfect acc
         if (overfit or val_cnt == 0) and (train_loss <= min_loss_to_stop and train_acc >= min_acc_to_stop):
             break
+        # Early stop on validation plateau to prevent overfitting
+        if val_cnt > 0 and es_counter >= es_patience:
+            break
 
-    return {"best_val": best_val, "history": history}
+    return {"best_val": best_val, "best_epoch": best_epoch, "history": history}
 
 
 def load_policy(ckpt_path: str, device: Optional[torch.device] = None) -> nn.Module:
