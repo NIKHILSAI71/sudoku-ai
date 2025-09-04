@@ -199,6 +199,15 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         dataset = _norm_path(getattr(args, "dataset", None))
         puzzles_path = _norm_path(getattr(args, "puzzles", None))
         solutions_path = _norm_path(getattr(args, "solutions", None))
+        # Progress logger to capture per-epoch updates from training
+        def _log_progress(label: str):
+            def _cb(ep: int, loss: float, acc: float) -> None:
+                try:
+                    logger.info("epoch %d %s: loss=%.6f acc=%.5f", int(ep), label, float(loss), float(acc))
+                except Exception:
+                    # Avoid training interruption on logging issues
+                    pass
+            return _cb
         # Pre-validate input files for a friendlier error than deep stack traces
         if dataset is not None:
             ds_path = Path(dataset)
@@ -242,6 +251,8 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
                     amp=False,
                     seed=42,
                     overfit=False,
+                    # With validation split, log validation metrics each epoch
+                    progress_cb=_log_progress("val"),
                 )
                 # If no puzzle provided, this was a training-only run
                 if args.input is None and args.stdin is None:
@@ -278,6 +289,8 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
                     seed=42,
                     overfit=True,
                     overfit_size=min(1024, max(100, limit)),
+                    # No validation in overfit mode; log training metrics
+                    progress_cb=_log_progress("train"),
                 )
         except Exception as e:
             logger.exception("supervised training failed: %s", e)
