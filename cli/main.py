@@ -180,7 +180,12 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
 
     t = Trace(steps=[])
 
+    strict_ai = bool(getattr(args, "strict_ai", False))
+
     def valid_state(b: Board) -> bool:
+        if strict_ai:
+            # In strict mode, do not consult candidates/validators
+            return True
         # Minimal consistency: every empty cell must have at least one legal candidate
         masks = b.candidates_mask()
         for r in range(9):
@@ -256,7 +261,7 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
                 )
                 # If no puzzle provided, this was a training-only run
                 if args.input is None and args.stdin is None:
-                    _ = load_policy(ckpt.as_posix(), device=device)
+                    _ = load_policy(ckpt.as_posix(), device=device, allow_oracle_fallback=not strict_ai)
                     console.print(f"Training complete. Checkpoint saved -> {ckpt}")
                     logger.info("training-only run complete -> %s", ckpt)
                     console.print(f"Log saved -> {log_path}")
@@ -298,13 +303,18 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             console.print(f"Log saved -> {log_path}")
             raise SystemExit(3)
         # If still no board (i.e., dataset training and no input), treat as training-only
-        if board is None and args.input is None and args.stdin is None:
-            _ = load_policy(ckpt.as_posix(), device=device)
+    if board is None and args.input is None and args.stdin is None:
+            _ = load_policy(ckpt.as_posix(), device=device, allow_oracle_fallback=not strict_ai)
             console.print(f"Training complete. Checkpoint saved -> {ckpt}")
             logger.info("training-only run complete -> %s", ckpt)
             console.print(f"Log saved -> {log_path}")
             return
-        policy = load_policy(ckpt.as_posix(), device=device)
+    try:
+            policy = load_policy(ckpt.as_posix(), device=device, allow_oracle_fallback=not strict_ai)
+    except Exception as e:
+            console.print(str(e), style="red")
+            logger.exception("policy load failed in strict mode")
+            raise SystemExit(2)
     else:
         # Not training, ensure we have an input board
         if args.input is None and args.stdin is None:
@@ -314,7 +324,12 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             console.print(f"Log saved -> {log_path}")
             raise SystemExit(2)
         board = _load_board(_norm_path(args.input), args.stdin)
-        policy = load_policy(_norm_path(args.ckpt) or "checkpoints/policy.pt", device=device)
+        try:
+            policy = load_policy(_norm_path(args.ckpt) or "checkpoints/policy.pt", device=device, allow_oracle_fallback=not strict_ai)
+        except Exception as e:
+            console.print(str(e), style="red")
+            logger.exception("policy load failed in strict mode")
+            raise SystemExit(2)
 
     # At this point we must have a board for solving
     if board is None:
@@ -331,7 +346,7 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         console.print(f"Log saved -> {log_path}")
         raise SystemExit(2)
 
-    # Enable deterministic propagation to strengthen AI solving
+    # Enable deterministic propagation to strengthen AI solving (unless strict)
     stats = backtracking.Stats()
     opts = Options(
         naked_singles=True,
@@ -344,6 +359,8 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
     )
 
     def propagate(board_obj: Board) -> None:
+        if strict_ai:
+            return
         run_pipeline(board_obj, max_iters=100, trace=t if args.trace else None, options=opts, stats=stats.heuristics)
         if not valid_state(board_obj):
             msg_ = "Propagation reached an invalid state."
@@ -353,7 +370,8 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             raise SystemExit(1)
 
     # Initial propagation pass
-    propagate(b)
+    if not strict_ai:
+        propagate(b)
 
     max_steps = args.max_steps
     # Policy sampling loop with propagation after each accepted move
@@ -369,16 +387,23 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             # Temperature scaling
             logits = logits / temperature
             probs = torch.softmax(logits, dim=-1)
-        masks = b.candidates_mask()
         mask_tensor = torch.zeros(81, 9, device=probs.device)
-        for idx in range(81):
-            r, c = divmod(idx, 9)
-            m = int(masks[r, c])
-            if b.grid[r, c] != 0 or m == 0:
-                continue
-            for d in range(1, 10):
-                if m & (1 << (d - 1)):
-                    mask_tensor[idx, d - 1] = 1.0
+        if strict_ai:
+            # Allow any digit for empty cells; disallow moves on filled cells
+            for idx in range(81):
+                r, c = divmod(idx, 9)
+                if b.grid[r, c] == 0:
+                    mask_tensor[idx, :] = 1.0
+        else:
+            masks = b.candidates_mask()
+            for idx in range(81):
+                r, c = divmod(idx, 9)
+                m = int(masks[r, c])
+                if b.grid[r, c] != 0 or m == 0:
+                    continue
+                for d in range(1, 10):
+                    if m & (1 << (d - 1)):
+                        mask_tensor[idx, d - 1] = 1.0
         masked = probs * mask_tensor
         flat = masked.view(-1)
         total = float(flat.sum().item())
@@ -398,7 +423,7 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             d = dig_idx + 1
             nb = b.copy()
             nb.set_cell(r, c, d)
-            if valid_state(nb):
+            if strict_ai or valid_state(nb):
                 b = nb
                 if args.trace:
                     t.add("policy", f"R{r+1}C{c+1}={d}")
@@ -419,7 +444,8 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             console.print(f"Log saved -> {log_path}")
             raise SystemExit(1)
         # Run propagation after every successful policy move
-        propagate(b)
+        if not strict_ai:
+            propagate(b)
 
     # No final fallback; AI must have completed by here or exited
 
@@ -507,6 +533,7 @@ def main() -> None:
     ap_ai.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available")
     ap_ai.add_argument("--max-steps", type=int, default=1000, help="Max policy steps")
     ap_ai.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature (>1 more random, <1 sharper)")
+    ap_ai.add_argument("--strict-ai", action="store_true", help="Disable DLX fallback and all rule-based help at inference")
     # On-the-fly training flags
     ap_ai.add_argument("--train", action="store_true", help="Train a tiny policy before solving (toy)")
     ap_ai.add_argument("--train-epochs", type=int, default=1, help="Epochs for on-the-fly training")
