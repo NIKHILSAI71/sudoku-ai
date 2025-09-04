@@ -162,11 +162,13 @@ class _SupDataset(Dataset):
     def __len__(self) -> int:
         return len(self.recs)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         r = self.recs[idx]
         x = board_to_tensor(r.x_line)  # (10,9,9) float32
         y = torch.as_tensor(r.y_targets, dtype=torch.long)  # (81,) with -100 ignore
-        return x, y
+        # Compute legality mask for the current board state
+        m = legal_mask_from_line(r.x_line)  # (81,9) float32 in {0,1}
+        return x, y, m
 
 
 def train_toy(
@@ -195,7 +197,7 @@ def train_supervised(
     solutions_path: Optional[str] = None,
     epochs: int = 1,
     batch_size: int = 64,
-    lr: float = 3e-4,
+    lr: float = 1e-4,
     val_split: float = 0.1,
     max_samples: Optional[int] = 20000,
     augment: bool = True,
@@ -205,6 +207,12 @@ def train_supervised(
     overfit_size: int = 512,
     min_loss_to_stop: Optional[float] = None,
     min_acc_to_stop: Optional[float] = None,
+    patience: Optional[int] = 10,
+    use_scheduler: bool = True,
+    scheduler_patience: int = 5,
+    scheduler_factor: float = 0.5,
+    legal_regularize: bool = True,
+    legal_lambda: float = 0.1,
     progress_cb: Optional[Callable[[int, float, float], None]] = None,
 ) -> Dict[str, Any]:
     """Supervised training for a Sudoku policy network.
@@ -306,31 +314,77 @@ def train_supervised(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SimplePolicyNet(width=64, drop=0.2).to(device)
     opt = optim.AdamW(model.parameters(), lr=float(lr), weight_decay=0.02)
+    scheduler = None
+    if bool(use_scheduler):
+        try:
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                opt,
+                mode="min",
+                factor=float(scheduler_factor),
+                patience=int(scheduler_patience),
+                threshold=1e-3,
+                min_lr=1e-6,
+                verbose=False,
+            )
+        except Exception:
+            scheduler = None
     # Use label smoothing when available; fall back silently if unsupported
     try:
         criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.05)
     except TypeError:
         criterion = nn.CrossEntropyLoss(ignore_index=-100)
-    scaler = torch.cuda.amp.GradScaler(enabled=bool(amp) and device.type == "cuda")
+    # Prefer new torch.amp API; fall back to torch.cuda.amp for older torch
+    _use_new_amp = False
+    try:
+        from torch.amp import GradScaler as _GradScaler  # type: ignore
+        from torch.amp import autocast as _autocast      # type: ignore
+        scaler = _GradScaler("cuda", enabled=bool(amp) and device.type == "cuda")
+        _use_new_amp = True
+    except Exception:
+        scaler = torch.cuda.amp.GradScaler(enabled=bool(amp) and device.type == "cuda")
 
     history: Dict[str, List[float]] = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
     best_val = float("inf")
     best_epoch = 0
+    epochs_since_improve = 0
 
     def _epoch_pass(dl: DataLoader, train: bool) -> Tuple[float, float]:
         model.train(train)
         tot_loss = 0.0
         tot_correct = 0
         tot_count = 0
-        for xb, yb in dl:
+        for xb, yb, mb in dl:
             xb = xb.to(device)
             yb = yb.to(device)
+            mb = mb.to(device)
             if train:
                 opt.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                # Autocast with new or legacy API
+                if _use_new_amp:
+                    ctx = _autocast("cuda", enabled=scaler.is_enabled())  # type: ignore
+                else:
+                    ctx = torch.cuda.amp.autocast(enabled=scaler.is_enabled())
+                with ctx:
                     logits = model(xb)  # (B,81,9)
                     loss = criterion(logits.view(-1, 9), yb.view(-1))
+                    if bool(legal_regularize):
+                        # Encourage probability mass on legal digits per cell
+                        with torch.no_grad():
+                            row_mask = (mb.sum(dim=-1) > 0)  # (B,81)
+                        logsum_total = torch.logsumexp(logits, dim=-1)  # (B,81)
+                        masked_logits = torch.where(mb > 0, logits, logits.new_full((), -1e9))
+                        logsum_legal = torch.logsumexp(masked_logits, dim=-1)  # (B,81)
+                        legal_prob = torch.clamp(torch.exp(logsum_legal - logsum_total), min=1e-6, max=1.0)
+                        aux = -torch.log(legal_prob)
+                        if row_mask.any():
+                            aux = aux[row_mask].mean()
+                            loss = loss + float(legal_lambda) * aux
                 scaler.scale(loss).backward()
+                # Gradient clipping for stability
+                try:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                except Exception:
+                    pass
                 scaler.step(opt)
                 scaler.update()
             else:
@@ -357,6 +411,12 @@ def train_supervised(
             val_loss, val_acc = _epoch_pass(val_loader, train=False)
         else:
             val_loss, val_acc = tr_loss, tr_acc
+        # Step LR scheduler on validation loss
+        try:
+            if scheduler is not None:
+                scheduler.step(val_loss)
+        except Exception:
+            pass
 
         history["train_loss"].append(tr_loss)
         history["train_acc"].append(tr_acc)
@@ -369,14 +429,20 @@ def train_supervised(
                 progress_cb(ep, float(val_loss), float(val_acc))
             except Exception:
                 pass
+        # Log with current LR if scheduler is used
+        try:
+            cur_lr = opt.param_groups[0]["lr"]
+        except Exception:
+            cur_lr = lr
         _log_to_terminal(
-            f"[train_supervised] epoch {ep}/{total_epochs}: train_loss={tr_loss:.6f} train_acc={tr_acc:.5f} val_loss={val_loss:.6f} val_acc={val_acc:.5f}"
+            f"[train_supervised] epoch {ep}/{total_epochs}: train_loss={tr_loss:.6f} train_acc={tr_acc:.5f} val_loss={val_loss:.6f} val_acc={val_acc:.5f} lr={cur_lr:.2e}"
         )
 
         # Track best validation (lower is better)
         if val_loss < best_val:
             best_val = val_loss
             best_epoch = ep
+            epochs_since_improve = 0
             # Save checkpoint on improvement
             torch.save(
                 {
@@ -395,6 +461,12 @@ def train_supervised(
         # Optional early stopping if thresholds provided (opt-in)
         stop_by_loss = (min_loss_to_stop is not None) and (val_loss <= float(min_loss_to_stop))
         stop_by_acc = (min_acc_to_stop is not None) and (val_acc >= float(min_acc_to_stop))
+        # Patience-based early stopping (no improvement)
+        if val_loss >= best_val:
+            epochs_since_improve += 1
+        if patience is not None and epochs_since_improve >= int(patience):
+            _log_to_terminal(f"[train_supervised] early stop: no val improvement in {int(patience)} epochs (best_epoch={best_epoch})")
+            break
         if stop_by_loss or stop_by_acc:
             break
 
