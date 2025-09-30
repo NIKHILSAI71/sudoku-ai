@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional, Callable, List, Dict, Any, Tuple
-import logging
 from pathlib import Path
-import os
 
 import torch
 import torch.nn as nn
@@ -11,12 +9,11 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 
 from sudoku_engine import parse_line, Board, board_to_line
-from sudoku_solvers import dlx as _dlx
 from . import data as _data
 
 
 # ----------------------------
-# Public helpers (kept stable)
+# Public helpers
 # ----------------------------
 
 def board_to_tensor(line: str) -> torch.Tensor:
@@ -52,71 +49,8 @@ def legal_mask_from_line(line: str) -> torch.Tensor:
 
 
 # ----------------------------
-# Deterministic oracle policy
+# Neural Network Policy
 # ----------------------------
-
-class OraclePolicy(nn.Module):
-    """A deterministic, solver-backed policy.
-
-    Given an input board tensor, this policy solves the puzzle (once per
-    sample) using the exact DLX solver and emits logits that put all mass
-    on the ground-truth digit for every empty cell. This guarantees that
-    any downstream sampler, when constrained by legal moves, selects only
-    correct digits. Accuracy is 100% and training loss can be reported as 0.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    @staticmethod
-    def _tensor_to_line(x: torch.Tensor) -> str:
-        # x: (10,9,9) one-hot; last channel = empty
-        # Robust to non-strict one-hot by taking argmax per cell.
-        grid = []
-        for r in range(9):
-            for c in range(9):
-                v = int(torch.argmax(x[:, r, c]).item())
-                if v == 9:
-                    grid.append('0')
-                else:
-                    grid.append(str(v + 1))
-        return ''.join(grid)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (N,10,9,9) -> (N,81,9)
-        device = x.device
-        x_cpu = x.detach().to('cpu')
-        batch_logits: List[torch.Tensor] = []
-        for i in range(x_cpu.shape[0]):
-            line = self._tensor_to_line(x_cpu[i])
-            b = Board(parse_line(line))
-            sol = _dlx.solve_one(b)
-            logits = torch.full((81, 9), -20.0, dtype=torch.float32)
-            if sol is None:
-                # If unsolvable (shouldn't happen for valid inputs), fall back to legal mask
-                m = legal_mask_from_line(line)
-                logits = logits.masked_fill(m == 1.0, 0.0)
-            else:
-                sol_line = board_to_line(sol.grid)
-                # For each empty cell, set the solved digit very high
-                for idx, ch in enumerate(line):
-                    if ch != '0':
-                        continue
-                    r, c = divmod(idx, 9)
-                    d_true = int(sol_line[idx])  # 1..9
-                    logits[idx, d_true - 1] = 20.0
-                # For already-filled cells keep all logits low; sampler masks them away
-            batch_logits.append(logits)
-        out = torch.stack(batch_logits, dim=0).to(device)
-        return out
-
-
-# ----------------------------
-# Supervised model and training utilities
-# ----------------------------
-
-def _log_to_terminal(msg: str) -> None:
-    print(msg, flush=True)
-
 
 class SimplePolicyNet(nn.Module):
     """A lightweight CNN that maps (10,9,9) -> (81,9) logits.
@@ -155,6 +89,10 @@ class SimplePolicyNet(nn.Module):
         return out.view(-1, 81, 9)
 
 
+# ----------------------------
+# Training Dataset
+# ----------------------------
+
 class _SupDataset(Dataset):
     def __init__(self, records: List[_data.SupervisedRecord]) -> None:
         self.recs = records
@@ -166,73 +104,56 @@ class _SupDataset(Dataset):
         r = self.recs[idx]
         x = board_to_tensor(r.x_line)  # (10,9,9) float32
         y = torch.as_tensor(r.y_targets, dtype=torch.long)  # (81,) with -100 ignore
-        # Compute legality mask for the current board state
         m = legal_mask_from_line(r.x_line)  # (81,9) float32 in {0,1}
         return x, y, m
 
 
-def train_toy(
-    epochs: int = 1,
-    limit: int = 500,
-    out_path: str = "checkpoints/policy.pt",
-    progress_cb: Optional[Callable[[int, float, float], None]] = None,
-) -> None:
-    """Writes an oracle checkpoint and emits zero-loss, perfect-acc logs.
-
-    This function keeps the API for compatibility, but does not perform
-    gradient-based training. It simply records that the policy is 'oracle'.
-    """
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"arch": "oracle", "meta": {"type": "toy", "epochs": int(epochs), "limit": int(limit)}}, out_path)
-    for ep in range(1, max(1, int(epochs)) + 1):
-        if progress_cb:
-            progress_cb(ep, 0.0, 1.0)
-        _log_to_terminal(f"[train_toy] epoch {ep}: loss=0.000000 acc=1.00000")
-
+# ----------------------------
+# Training Function
+# ----------------------------
 
 def train_supervised(
     out_path: str = "checkpoints/policy.pt",
     dataset_jsonl: Optional[str] = None,
-    puzzles_path: Optional[str] = None,
-    solutions_path: Optional[str] = None,
-    epochs: int = 1,
+    puzzles: Optional[List[str]] = None,
+    solutions: Optional[List[str]] = None,
+    epochs: int = 10,
     batch_size: int = 64,
-    lr: float = 1e-4,
+    lr: float = 1e-3,
     val_split: float = 0.1,
-    max_samples: Optional[int] = 20000,
+    max_samples: Optional[int] = None,
     augment: bool = True,
-    amp: bool = False,
     seed: int = 42,
-    overfit: bool = False,
-    overfit_size: int = 512,
-    min_loss_to_stop: Optional[float] = None,
-    min_acc_to_stop: Optional[float] = None,
-    patience: Optional[int] = 10,
-    use_scheduler: bool = True,
-    scheduler_patience: int = 5,
-    scheduler_factor: float = 0.5,
-    legal_regularize: bool = True,
-    legal_lambda: float = 0.1,
     progress_cb: Optional[Callable[[int, float, float], None]] = None,
 ) -> Dict[str, Any]:
-    """Supervised training for a Sudoku policy network.
+    """Simplified supervised training for a Sudoku policy network.
 
-    Accepts either a JSONL dataset (with keys 'puzzle' and optional 'solution')
-    or separate puzzles/solutions text files. If solutions are missing, they
-    are generated via the exact DLX solver.
+    Args:
+        out_path: Path to save checkpoint
+        dataset_jsonl: Path to JSONL dataset with 'puzzle' and 'solution' keys
+        puzzles: List of puzzle strings (alternative to dataset_jsonl)
+        solutions: List of solution strings (must match puzzles)
+        epochs: Number of training epochs
+        batch_size: Batch size
+        lr: Learning rate
+        val_split: Validation split fraction
+        max_samples: Maximum number of samples to use
+        augment: Whether to augment data
+        seed: Random seed
+        progress_cb: Optional callback (epoch, loss, acc) -> None
 
-    Returns a history dict and writes a checkpoint with arch='cnn_v1'.
+    Returns:
+        Dict with training history
     """
     torch.manual_seed(int(seed))
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # 1) Collect puzzles and solutions
-    puzzles: List[str] = []
-    solutions: List[str] = []
-    if dataset_jsonl is not None:
-        # Parse JSONL lines: {"puzzle": "...", "solution": "..." (optional)}
-        import json
+    # 1) Load puzzles and solutions
+    pz_list: List[str] = []
+    sol_list: List[str] = []
 
+    if dataset_jsonl is not None:
+        import json
         path = Path(dataset_jsonl)
         if not path.exists():
             raise FileNotFoundError(f"Dataset not found: {path}")
@@ -242,111 +163,63 @@ def train_supervised(
                 continue
             try:
                 rec = json.loads(ln)
+                if "puzzle" in rec and "solution" in rec:
+                    pz_list.append(str(rec["puzzle"]))
+                    sol_list.append(str(rec["solution"]))
             except Exception:
                 continue
-            if "puzzle" not in rec:
-                continue
-            puzzles.append(str(rec["puzzle"]))
-            if "solution" in rec and rec["solution"]:
-                solutions.append(str(rec["solution"]))
-            else:
-                solutions.append("")  # placeholder to be filled by solver
+    elif puzzles is not None and solutions is not None:
+        if len(puzzles) != len(solutions):
+            raise ValueError("Puzzles and solutions must have same length")
+        pz_list = puzzles
+        sol_list = solutions
     else:
-        if puzzles_path is None:
-            raise ValueError("Provide either dataset_jsonl or puzzles_path")
-        puzzles = _data.read_puzzles([puzzles_path])
-        if solutions_path is not None and Path(solutions_path).exists():
-            sol_lines = _data.read_puzzles([solutions_path])
-        else:
-            sol_lines = [""] * len(puzzles)
-        # align sizes
-        if len(sol_lines) < len(puzzles):
-            sol_lines = sol_lines + [""] * (len(puzzles) - len(sol_lines))
-        solutions = sol_lines[: len(puzzles)]
+        raise ValueError("Provide either dataset_jsonl or (puzzles, solutions)")
 
-    # 2) Solve missing solutions with DLX
-    solved_puzzles: List[str] = []
-    solved_solutions: List[str] = []
-    for pz, sol in zip(puzzles, solutions):
-        if sol and len(sol.strip()) == 81 and set(sol) <= set("0123456789"):
-            solved_puzzles.append(pz)
-            solved_solutions.append(sol)
-            continue
-        b = Board(parse_line(pz))
-        s = _dlx.solve_one(b)
-        if s is None:
-            # skip unsolvable
-            continue
-        solved_puzzles.append(pz)
-        solved_solutions.append(board_to_line(s.grid))
+    if not pz_list:
+        raise RuntimeError("No valid puzzle-solution pairs found")
 
-    if not solved_puzzles:
-        raise RuntimeError("No solvable puzzles available for supervised training")
-
-    # 3) Build supervised records (with lightweight curriculum)
+    # 2) Build supervised records
     recs = _data.build_supervised_records(
-        solved_puzzles,
-        solved_solutions,
+        pz_list,
+        sol_list,
         max_samples=max_samples,
         augment=bool(augment),
     )
-    if overfit:
-        recs = recs[: int(max(1, overfit_size))]
 
-    # 4) Dataset and splits
+    if not recs:
+        raise RuntimeError("No training samples generated")
+
+    # 3) Dataset and splits
     full_ds = _SupDataset(recs)
-    if overfit or val_split <= 0.0 or len(full_ds) < 10:
+    if val_split <= 0.0 or len(full_ds) < 10:
         train_ds = full_ds
         val_ds = None
     else:
         n_total = len(full_ds)
         n_val = max(1, int(n_total * float(val_split)))
         n_train = max(1, n_total - n_val)
-        # Ensure sizes sum correctly
         if n_train + n_val > n_total:
             n_val = n_total - n_train
-        train_ds, val_ds = random_split(full_ds, [n_train, n_val], torch.Generator().manual_seed(int(seed)))
+        train_ds, val_ds = random_split(
+            full_ds, [n_train, n_val], torch.Generator().manual_seed(int(seed))
+        )
 
-    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False, num_workers=0) if val_ds else None
+    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False) if val_ds else None
 
-    # 5) Model/optim/loss
+    # 4) Model, optimizer, loss
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SimplePolicyNet(width=64, drop=0.2).to(device)
-    opt = optim.AdamW(model.parameters(), lr=float(lr), weight_decay=0.02)
-    scheduler = None
-    if bool(use_scheduler):
-        try:
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                opt,
-                mode="min",
-                factor=float(scheduler_factor),
-                patience=int(scheduler_patience),
-                threshold=1e-3,
-                min_lr=1e-6,
-                verbose=False,
-            )
-        except Exception:
-            scheduler = None
-    # Use label smoothing when available; fall back silently if unsupported
-    try:
-        criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.05)
-    except TypeError:
-        criterion = nn.CrossEntropyLoss(ignore_index=-100)
-    # Prefer new torch.amp API; fall back to torch.cuda.amp for older torch
-    _use_new_amp = False
-    try:
-        from torch.amp import GradScaler as _GradScaler  # type: ignore
-        from torch.amp import autocast as _autocast      # type: ignore
-        scaler = _GradScaler("cuda", enabled=bool(amp) and device.type == "cuda")
-        _use_new_amp = True
-    except Exception:
-        scaler = torch.cuda.amp.GradScaler(enabled=bool(amp) and device.type == "cuda")
+    opt = optim.AdamW(model.parameters(), lr=float(lr), weight_decay=0.01)
+    criterion = nn.CrossEntropyLoss(ignore_index=-100)
 
-    history: Dict[str, List[float]] = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
-    best_val = float("inf")
-    best_epoch = 0
-    epochs_since_improve = 0
+    history: Dict[str, List[float]] = {
+        "train_loss": [],
+        "train_acc": [],
+        "val_loss": [],
+        "val_acc": []
+    }
 
     def _epoch_pass(dl: DataLoader, train: bool) -> Tuple[float, float]:
         model.train(train)
@@ -356,37 +229,12 @@ def train_supervised(
         for xb, yb, mb in dl:
             xb = xb.to(device)
             yb = yb.to(device)
-            mb = mb.to(device)
             if train:
-                opt.zero_grad(set_to_none=True)
-                # Autocast with new or legacy API
-                if _use_new_amp:
-                    ctx = _autocast("cuda", enabled=scaler.is_enabled())  # type: ignore
-                else:
-                    ctx = torch.cuda.amp.autocast(enabled=scaler.is_enabled())
-                with ctx:
-                    logits = model(xb)  # (B,81,9)
-                    loss = criterion(logits.view(-1, 9), yb.view(-1))
-                    if bool(legal_regularize):
-                        # Encourage probability mass on legal digits per cell
-                        with torch.no_grad():
-                            row_mask = (mb.sum(dim=-1) > 0)  # (B,81)
-                        logsum_total = torch.logsumexp(logits, dim=-1)  # (B,81)
-                        masked_logits = torch.where(mb > 0, logits, logits.new_full((), -1e9))
-                        logsum_legal = torch.logsumexp(masked_logits, dim=-1)  # (B,81)
-                        legal_prob = torch.clamp(torch.exp(logsum_legal - logsum_total), min=1e-6, max=1.0)
-                        aux = -torch.log(legal_prob)
-                        if row_mask.any():
-                            aux = aux[row_mask].mean()
-                            loss = loss + float(legal_lambda) * aux
-                scaler.scale(loss).backward()
-                # Gradient clipping for stability
-                try:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                except Exception:
-                    pass
-                scaler.step(opt)
-                scaler.update()
+                opt.zero_grad()
+                logits = model(xb)  # (B,81,9)
+                loss = criterion(logits.view(-1, 9), yb.view(-1))
+                loss.backward()
+                opt.step()
             else:
                 with torch.no_grad():
                     logits = model(xb)
@@ -403,7 +251,7 @@ def train_supervised(
         avg_acc = (tot_correct / tot_count) if tot_count > 0 else 0.0
         return avg_loss, avg_acc
 
-    # 6) Training loop
+    # 5) Training loop
     total_epochs = max(1, int(epochs))
     for ep in range(1, total_epochs + 1):
         tr_loss, tr_acc = _epoch_pass(train_loader, train=True)
@@ -411,110 +259,64 @@ def train_supervised(
             val_loss, val_acc = _epoch_pass(val_loader, train=False)
         else:
             val_loss, val_acc = tr_loss, tr_acc
-        # Step LR scheduler on validation loss
-        try:
-            if scheduler is not None:
-                scheduler.step(val_loss)
-        except Exception:
-            pass
 
         history["train_loss"].append(tr_loss)
         history["train_acc"].append(tr_acc)
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
 
-        # Progress callback prefers validation metrics when available
         if progress_cb:
             try:
                 progress_cb(ep, float(val_loss), float(val_acc))
             except Exception:
                 pass
-        # Log with current LR if scheduler is used
-        try:
-            cur_lr = opt.param_groups[0]["lr"]
-        except Exception:
-            cur_lr = lr
-        _log_to_terminal(
-            f"[train_supervised] epoch {ep}/{total_epochs}: train_loss={tr_loss:.6f} train_acc={tr_acc:.5f} val_loss={val_loss:.6f} val_acc={val_acc:.5f} lr={cur_lr:.2e}"
+
+        print(
+            f"[train] epoch {ep}/{total_epochs}: "
+            f"train_loss={tr_loss:.4f} train_acc={tr_acc:.3f} "
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.3f}",
+            flush=True
         )
 
-        # Track best validation (lower is better)
-        if val_loss < best_val:
-            best_val = val_loss
-            best_epoch = ep
-            epochs_since_improve = 0
-            # Save checkpoint on improvement
-            torch.save(
-                {
-                    "arch": "cnn_v1",
-                    "meta": {
-                        "type": "supervised",
-                        "epochs": total_epochs,
-                        "best_val": float(best_val),
-                        "best_epoch": int(best_epoch),
-                    },
-                    "model_state": model.state_dict(),
-                },
-                out_path,
-            )
-
-        # Optional early stopping if thresholds provided (opt-in)
-        stop_by_loss = (min_loss_to_stop is not None) and (val_loss <= float(min_loss_to_stop))
-        stop_by_acc = (min_acc_to_stop is not None) and (val_acc >= float(min_acc_to_stop))
-        # Patience-based early stopping (no improvement)
-        if val_loss >= best_val:
-            epochs_since_improve += 1
-        if patience is not None and epochs_since_improve >= int(patience):
-            _log_to_terminal(f"[train_supervised] early stop: no val improvement in {int(patience)} epochs (best_epoch={best_epoch})")
-            break
-        if stop_by_loss or stop_by_acc:
-            break
-
-    # If never saved (e.g., no val improvement), save final
-    if not Path(out_path).exists():
-        torch.save(
-            {
-                "arch": "cnn_v1",
-                "meta": {
-                    "type": "supervised",
-                    "epochs": total_epochs,
-                    "best_val": float(best_val),
-                    "best_epoch": int(best_epoch),
-                },
-                "model_state": model.state_dict(),
+    # 6) Save checkpoint
+    torch.save(
+        {
+            "arch": "simple_policy_net",
+            "model_state": model.state_dict(),
+            "meta": {
+                "epochs": total_epochs,
+                "val_loss": history["val_loss"][-1] if history["val_loss"] else 0.0,
+                "val_acc": history["val_acc"][-1] if history["val_acc"] else 0.0,
             },
-            out_path,
-        )
+        },
+        out_path,
+    )
 
-    return {"best_val": float(best_val), "best_epoch": int(best_epoch), "history": history}
+    return {"history": history}
+
+
 def load_policy(
     ckpt_path: str,
     device: Optional[torch.device] = None,
-    *,
-    allow_oracle_fallback: bool = True,
 ) -> nn.Module:
     """Load a policy checkpoint.
 
-    - If arch == 'oracle' (or missing), return OraclePolicy.
-    - Otherwise, default to OraclePolicy for robustness.
+    Args:
+        ckpt_path: Path to checkpoint file
+        device: Target device (cuda/cpu)
+
+    Returns:
+        Loaded SimplePolicyNet model
     """
-    state = torch.load(ckpt_path, map_location='cpu')
-    arch = state.get("arch") if isinstance(state, dict) else None
-    if arch == "cnn_v1" and isinstance(state, dict) and "model_state" in state:
-        model = SimplePolicyNet()
-        model.load_state_dict(state["model_state"])  # type: ignore[arg-type]
-        if device is not None:
-            model.to(device)
-        model.eval()
-        return model
-    # Strict mode: disallow fallback to OraclePolicy
-    strict_env = os.getenv("SUDOKU_POLICY_STRICT", "").strip() == "1"
-    if strict_env or not allow_oracle_fallback:
-        raise RuntimeError("Non-cnn_v1 checkpoint; strict mode forbids Oracle fallback (DLX-backed).")
-    # Default/fallback: deterministic oracle (keeps CLI/tests robust)
-    model = OraclePolicy()
-    if device is not None:
-        model.to(device)
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    state = torch.load(ckpt_path, map_location="cpu")
+    if not isinstance(state, dict) or "model_state" not in state:
+        raise RuntimeError(f"Invalid checkpoint format: {ckpt_path}")
+
+    model = SimplePolicyNet(width=64, drop=0.2)
+    model.load_state_dict(state["model_state"])
+    model.to(device)
     model.eval()
     return model
-
