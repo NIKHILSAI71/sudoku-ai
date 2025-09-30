@@ -9,10 +9,21 @@ This project uses a convolutional neural network to solve Sudoku puzzles entirel
 ## ✨ Features
 
 - **Pure AI Solving**: Neural network trained to predict next moves
-- **No Algorithmic Fallbacks**: 100% learned solution strategy
+- **No Algorithmic Fallbacks During Solving**: 100% learned solution strategy
+- **Auto-Generate Training Data**: DLX solver used only for training data prep
 - **Clean Architecture**: Minimal codebase focused on core functionality
-- **Easy Training**: Train on your own puzzle datasets
+- **Easy Training**: Train from puzzle-only files
 - **Production Ready**: Simplified, maintainable code structure
+
+### 🔍 How It Works
+
+**Solving**: Pure AI neural network (no algorithmic help)
+**Training**: DLX solver generates solutions for training data (offline, one-time)
+
+This hybrid approach gives you the best of both worlds:
+- ✅ Can bootstrap training from scratch (no external datasets needed)
+- ✅ AI model does all the actual puzzle solving
+- ✅ Clear separation: DLX = data prep, NN = solving
 
 ---
 
@@ -43,18 +54,27 @@ pip install -e . --extra-index-url https://download.pytorch.org/whl/cu118
 
 ### 1. Train a Model
 
-First, you need a dataset in JSONL format where each line contains a puzzle-solution pair:
+You can train from:
+- **Puzzle-only file** (solutions auto-generated)
+- **JSONL dataset** (with or without solutions)
 
-```jsonl
-{"puzzle": "530070000600195000098000060800060003400803001700020006060000280000419005000080079", "solution": "534678912672195348198342567859761423426853791713924856961537284287419635345286179"}
-{"puzzle": "000000000000000000000000000000000000000000000000000000000000000000000000000000000", "solution": "123456789456789123789123456214365897365897214897214365531642978642978531978531642"}
-```
-
-Then train:
-
+**Option A: Train from puzzle file (easiest)**
 ```bash
-sudoku train --dataset data/puzzles.jsonl --output checkpoints/my_model.pt --epochs 20
+# Create puzzles.txt with one puzzle per line (81 chars, 0 for empty)
+# Solutions will be auto-generated using DLX solver
+sudoku train --puzzles examples/puzzles_sample.txt --epochs 20
 ```
+
+**Option B: Train from JSONL dataset**
+```jsonl
+{"puzzle": "530070000600195000098000060800060003400803001700020006060000280000419005000080079"}
+{"puzzle": "003020600900305001001806400008102900700000008006708200002609500800203009005010300"}
+```
+```bash
+sudoku train --dataset data/puzzles.jsonl --epochs 20
+```
+
+**Note**: Solutions in dataset are optional - if missing, they'll be generated automatically using a DLX solver (for training data prep only)
 
 **Training Options:**
 ```bash
