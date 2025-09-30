@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import logging
 from rich.console import Console
 
 from sudoku_engine import Board, parse_line, board_to_line
 from ui.tui import render_pretty
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def load_puzzle(path: str | None, stdin_data: str | None) -> Board:
@@ -57,13 +59,16 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
     # Solve puzzle
-    console.print(f"🤖 Solving puzzle (max steps: {args.max_steps})...")
+    console.print(f"🤖 Solving puzzle (max steps: {args.max_steps}, temperature: {args.temperature})...")
+    logger.info(f"Starting AI solving loop (max_steps={args.max_steps}, temperature={args.temperature})")
 
     b = board.copy()
     temperature = max(0.01, float(args.temperature))
+    moves_made = 0
 
     for step in range(args.max_steps):
         if b.is_complete():
+            logger.info(f"✅ Puzzle completed in {step} steps!")
             break
 
         # Get model prediction
@@ -74,6 +79,8 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             logits = policy(x)[0]  # (81, 9)
             logits = logits / temperature
             probs = torch.softmax(logits, dim=-1)
+
+        logger.debug(f"Step {step+1}: Got NN predictions")
 
         # Create legal move mask
         masks = b.candidates_mask()
@@ -110,18 +117,27 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
 
         # Make move
         b.set_cell(r, c, d)
+        moves_made += 1
+
+        logger.debug(f"Step {step+1}: Placed {d} at R{r+1}C{c+1}")
 
         if args.verbose:
             console.print(f"  Step {step + 1}: R{r+1}C{c+1}={d}")
+        elif (step + 1) % 10 == 0:
+            filled = sum(1 for i in range(81) if b.grid[divmod(i, 9)] != 0)
+            console.print(f"  Progress: {step+1} steps, {filled}/81 cells filled...")
 
     # Check completion
     if not b.is_complete():
-        console.print(f"❌ Did not complete within {args.max_steps} steps", style="red")
+        filled = sum(1 for i in range(81) if b.grid[divmod(i, 9)] != 0)
+        logger.error(f"Failed to complete: {filled}/81 cells filled after {moves_made} moves")
+        console.print(f"❌ Did not complete within {args.max_steps} steps ({filled}/81 filled)", style="red")
         raise SystemExit(1)
 
     # Output solution
     solution = board_to_line(b.grid)
-    console.print("\n✅ Solution found!", style="green bold")
+    logger.info(f"✅ Solution found in {moves_made} moves!")
+    console.print(f"\n✅ Solution found in {moves_made} moves!", style="green bold")
     console.print(solution)
 
     if args.pretty:
@@ -140,15 +156,28 @@ def cmd_train(args: argparse.Namespace) -> None:
     from sudoku_ai.policy import train_supervised
 
     console.print("🎯 Starting training...")
-    console.print(f"  Dataset: {args.dataset or 'N/A'}")
+    console.print(f"  Dataset: {args.dataset or args.puzzles or 'N/A'}")
     console.print(f"  Epochs: {args.epochs}")
     console.print(f"  Batch size: {args.batch_size}")
     console.print(f"  Output: {args.output}")
+
+    # Load puzzles from file if provided
+    puzzles_list = None
+    if args.puzzles:
+        console.print(f"📂 Loading puzzles from: {args.puzzles}")
+        puzzle_path = Path(args.puzzles)
+        if not puzzle_path.exists():
+            console.print(f"❌ Puzzle file not found: {args.puzzles}", style="red")
+            raise SystemExit(1)
+        puzzles_list = [line.strip() for line in puzzle_path.read_text().splitlines() if line.strip()]
+        console.print(f"✅ Loaded {len(puzzles_list)} puzzles")
 
     try:
         result = train_supervised(
             out_path=args.output,
             dataset_jsonl=args.dataset,
+            puzzles=puzzles_list,
+            solutions=None,  # Will be generated
             epochs=args.epochs,
             batch_size=args.batch_size,
             lr=args.lr,
@@ -240,8 +269,12 @@ def main() -> None:
     train_parser.add_argument(
         "--dataset",
         type=str,
-        required=True,
-        help="Path to JSONL dataset (each line: {\"puzzle\": \"...\", \"solution\": \"...\"})"
+        help="Path to JSONL dataset (puzzle+solution or puzzle-only, solutions auto-generated)"
+    )
+    train_parser.add_argument(
+        "--puzzles",
+        type=str,
+        help="Path to text file with puzzles (one per line, solutions auto-generated)"
     )
     train_parser.add_argument(
         "--output",
