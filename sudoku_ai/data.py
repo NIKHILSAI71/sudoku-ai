@@ -150,14 +150,39 @@ class SupervisedRecord:
     y_targets: np.ndarray  # (81,) with -100 for ignore
 
 
-def build_supervised_records(puzzles: List[str], solutions: List[str], max_samples: Optional[int] = None, augment: bool = True) -> List[SupervisedRecord]:
+def build_supervised_records(
+    puzzles: List[str],
+    solutions: List[str],
+    max_samples: Optional[int] = None,
+    augment: bool = True
+) -> List[SupervisedRecord]:
+    """Build supervised training records from puzzle-solution pairs.
+
+    Args:
+        puzzles: List of puzzle strings (81 chars, 0 for empty)
+        solutions: List of solution strings (81 chars, all filled)
+        max_samples: Maximum number of samples to generate
+        augment: Whether to apply data augmentation
+
+    Returns:
+        List of SupervisedRecord objects for training
+    """
+    if len(puzzles) != len(solutions):
+        raise ValueError(f"Puzzles ({len(puzzles)}) and solutions ({len(solutions)}) must have same length")
+
     recs: List[SupervisedRecord] = []
     for pz, sol in zip(puzzles, solutions):
+        # Validate solution is complete
+        if len(sol) != 81 or '0' in sol:
+            continue  # Skip incomplete solutions
+
         if augment:
             pz, sol = random_augment(pz, sol, enable=True)
+
         for line, tgt in make_partial_samples(pz, sol, steps=40):
             recs.append(SupervisedRecord(line, tgt))
             if max_samples is not None and len(recs) >= max_samples:
                 return recs
+
     return recs
 
