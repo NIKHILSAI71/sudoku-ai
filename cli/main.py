@@ -338,6 +338,11 @@ def main() -> None:
         default=42,
         help="Random seed"
     )
+    train_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable debug logging"
+    )
     train_parser.set_defaults(func=cmd_train)
 
     args = parser.parse_args()
