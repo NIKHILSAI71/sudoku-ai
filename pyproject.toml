@@ -3,64 +3,25 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sudoku-pro"
-version = "0.1.0"
-description = "Production-grade Sudoku engine with multiple solvers and a PyTorch learning agent"
+name = "sudoku-ai"
+version = "1.0.0"
+description = "Production-grade AI-powered Sudoku solver using neural networks"
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{ name = "Sudoku Team" }]
+authors = [{ name = "Sudoku AI Team" }]
 license = { text = "MIT" }
 dependencies = [
   "numpy>=1.26",
   "rich>=13.7",
-  "typing-extensions>=4.9",
-  "tqdm>=4.66",
-  "pydantic>=2.6",
-  "torch>=2.2; platform_system != 'Darwin' or platform_machine != 'arm64'",
-]
-
-[project.optional-dependencies]
-sat = ["python-sat[pblib,aiger]>=0.1.8"]
-cpsat = ["ortools>=9.10"]
-dev = [
-  "pytest>=8.2",
-  "pytest-cov>=4.1",
-  "hypothesis>=6.98",
-  "mypy>=1.10",
-  "ruff>=0.5",
-  "black>=24.4",
-  "types-tqdm",
+  "torch>=2.0",
 ]
 
 [project.scripts]
 sudoku = "cli.main:main"
 
-[tool.black]
-line-length = 100
-target-version = ["py311"]
-
-[tool.ruff]
-line-length = 100
-target-version = "py311"
-lint.select = ["E", "F", "I", "B", "UP", "ANN", "ARG"]
-lint.ignore = ["ANN101", "ANN102", "ANN401"]
-exclude = [".venv", "build", "dist"]
-
-[tool.mypy]
-python_version = "3.11"
-strict = false
-warn_return_any = true
-warn_unused_configs = true
-ignore_missing_imports = true
-
-[tool.pytest.ini_options]
-minversion = "7.0"
-addopts = "-q"
-testpaths = ["tests"]
-
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["sudoku_engine*", "sudoku_solvers*", "sudoku_ai*", "cli*", "ui*"]
+include = ["sudoku_engine*", "sudoku_ai*", "cli*", "ui*"]
 
 [tool.setuptools.package-data]
-"sudoku" = ["examples/*", "notebooks/*.ipynb"]
+"sudoku" = ["examples/*"]
