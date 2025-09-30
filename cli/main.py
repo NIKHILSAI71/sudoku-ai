@@ -27,6 +27,13 @@ def load_puzzle(path: str | None, stdin_data: str | None) -> Board:
 
 def cmd_ai_solve(args: argparse.Namespace) -> None:
     """AI-powered Sudoku solver using trained neural network."""
+    # Setup logging
+    from sudoku_ai.logger_config import setup_logging
+    log_level = "DEBUG" if args.verbose else "INFO"
+    log_file = setup_logging(level=log_level, log_to_file=True)
+    if log_file:
+        logger.info(f"📝 Logging to: {log_file}")
+
     try:
         import torch
     except ImportError:
@@ -147,6 +154,14 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
 
 def cmd_train(args: argparse.Namespace) -> None:
     """Train a Sudoku AI model."""
+    # Setup logging
+    from sudoku_ai.logger_config import setup_logging
+    log_level = "DEBUG" if getattr(args, 'verbose', False) else "INFO"
+    log_file = setup_logging(level=log_level, log_to_file=True)
+    if log_file:
+        logger.info(f"📝 Logging to: {log_file}")
+        console.print(f"📝 Logging to: {log_file}")
+
     try:
         import torch
     except ImportError:
