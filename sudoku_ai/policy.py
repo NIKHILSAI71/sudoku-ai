@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Optional, Callable, List, Dict, Any, Tuple
 from pathlib import Path
+import logging
 
 import torch
 import torch.nn as nn
@@ -10,6 +11,8 @@ from torch.utils.data import Dataset, DataLoader, random_split
 
 from sudoku_engine import parse_line, Board, board_to_line
 from . import data as _data
+
+logger = logging.getLogger(__name__)
 
 
 # ----------------------------
@@ -163,23 +166,60 @@ def train_supervised(
                 continue
             try:
                 rec = json.loads(ln)
-                if "puzzle" in rec and "solution" in rec:
+                if "puzzle" in rec:
                     pz_list.append(str(rec["puzzle"]))
-                    sol_list.append(str(rec["solution"]))
+                    # Solution is optional - we can generate it
+                    sol_list.append(str(rec.get("solution", "")))
             except Exception:
                 continue
-    elif puzzles is not None and solutions is not None:
-        if len(puzzles) != len(solutions):
-            raise ValueError("Puzzles and solutions must have same length")
+    elif puzzles is not None:
         pz_list = puzzles
-        sol_list = solutions
+        if solutions is not None:
+            if len(puzzles) != len(solutions):
+                raise ValueError("Puzzles and solutions must have same length")
+            sol_list = solutions
+        else:
+            sol_list = [""] * len(puzzles)  # Will generate solutions
     else:
-        raise ValueError("Provide either dataset_jsonl or (puzzles, solutions)")
+        raise ValueError("Provide either dataset_jsonl or puzzles")
 
     if not pz_list:
-        raise RuntimeError("No valid puzzle-solution pairs found")
+        raise RuntimeError("No valid puzzles found")
+
+    # Generate missing solutions using DLX solver (training data prep only)
+    missing_count = sum(1 for s in sol_list if not s or len(s) != 81)
+    if missing_count > 0:
+        logger.info(f"⚙️ Generating {missing_count} solutions using DLX solver (training data prep only)...")
+        print(f"⚙️ Generating {missing_count} solutions using DLX solver (training data prep)...")
+        from sudoku_solvers.dlx import solve_one as dlx_solve
+
+        solved_count = 0
+        for i, (pz, sol) in enumerate(zip(pz_list, sol_list)):
+            if not sol or len(sol) != 81 or '0' in sol:
+                logger.debug(f"   Solving puzzle {i+1}/{len(pz_list)}...")
+                b = Board(parse_line(pz))
+                solved = dlx_solve(b)
+                if solved:
+                    sol_list[i] = board_to_line(solved.grid)
+                    solved_count += 1
+                    if (i + 1) % 10 == 0:
+                        print(f"   Progress: {i+1}/{missing_count} puzzles solved...")
+                else:
+                    sol_list[i] = ""  # Mark as unsolvable
+                    logger.warning(f"   ⚠️ Puzzle {i+1} is unsolvable")
+
+        # Filter out unsolvable puzzles
+        valid_pairs = [(pz, sol) for pz, sol in zip(pz_list, sol_list) if sol and '0' not in sol]
+        pz_list, sol_list = [p[0] for p in valid_pairs], [p[1] for p in valid_pairs]
+        logger.info(f"✅ Generated {solved_count} solutions. {len(pz_list)} solvable puzzles ready for training.")
+        print(f"✅ Generated solutions. {len(pz_list)} solvable puzzles ready for training.")
+
+    if not pz_list:
+        raise RuntimeError("No solvable puzzles available for training")
 
     # 2) Build supervised records
+    logger.info(f"📦 Building training dataset from {len(pz_list)} puzzles...")
+    print(f"📦 Building training dataset from {len(pz_list)} puzzles...")
     recs = _data.build_supervised_records(
         pz_list,
         sol_list,
@@ -189,6 +229,9 @@ def train_supervised(
 
     if not recs:
         raise RuntimeError("No training samples generated")
+
+    logger.info(f"✅ Created {len(recs)} training samples")
+    print(f"✅ Created {len(recs)} training samples")
 
     # 3) Dataset and splits
     full_ds = _SupDataset(recs)
@@ -210,9 +253,17 @@ def train_supervised(
 
     # 4) Model, optimizer, loss
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"🔧 Initializing model on device: {device}")
+    print(f"🔧 Device: {device}")
+
     model = SimplePolicyNet(width=64, drop=0.2).to(device)
+    param_count = sum(p.numel() for p in model.parameters())
+    logger.info(f"🧠 SimplePolicyNet initialized with {param_count:,} parameters")
+    print(f"🧠 Model: SimplePolicyNet ({param_count:,} parameters)")
+
     opt = optim.AdamW(model.parameters(), lr=float(lr), weight_decay=0.01)
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    logger.info(f"⚙️ Optimizer: AdamW (lr={lr}, weight_decay=0.01)")
 
     history: Dict[str, List[float]] = {
         "train_loss": [],
@@ -253,9 +304,17 @@ def train_supervised(
 
     # 5) Training loop
     total_epochs = max(1, int(epochs))
+    logger.info(f"🎯 Starting training for {total_epochs} epochs...")
+    print(f"\n{'='*60}")
+    print(f"🎯 Training: {total_epochs} epochs, {len(train_ds)} samples")
+    print(f"{'='*60}\n")
+
     for ep in range(1, total_epochs + 1):
+        logger.info(f"Epoch {ep}/{total_epochs}: Training...")
         tr_loss, tr_acc = _epoch_pass(train_loader, train=True)
+
         if val_loader is not None:
+            logger.info(f"Epoch {ep}/{total_epochs}: Validating...")
             val_loss, val_acc = _epoch_pass(val_loader, train=False)
         else:
             val_loss, val_acc = tr_loss, tr_acc
@@ -271,14 +330,19 @@ def train_supervised(
             except Exception:
                 pass
 
-        print(
-            f"[train] epoch {ep}/{total_epochs}: "
-            f"train_loss={tr_loss:.4f} train_acc={tr_acc:.3f} "
-            f"val_loss={val_loss:.4f} val_acc={val_acc:.3f}",
-            flush=True
+        # Log to both logger and console
+        log_msg = (
+            f"Epoch {ep}/{total_epochs}: "
+            f"train_loss={tr_loss:.4f} train_acc={tr_acc:.3f} | "
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.3f}"
         )
+        logger.info(log_msg)
+        print(f"📊 {log_msg}", flush=True)
 
     # 6) Save checkpoint
+    logger.info(f"💾 Saving model checkpoint to: {out_path}")
+    print(f"\n💾 Saving model to: {out_path}")
+
     torch.save(
         {
             "arch": "simple_policy_net",
@@ -292,6 +356,7 @@ def train_supervised(
         out_path,
     )
 
+    logger.info("✅ Training complete!")
     return {"history": history}
 
 
