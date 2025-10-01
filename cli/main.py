@@ -121,8 +121,11 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
                 console.print(f"💡 The puzzle may be unsolvable or the model made an error earlier.", style="yellow")
                 raise SystemExit(1)
 
-            # Get model predictions with constraint awareness (pass mask)
-            logits = policy(x.unsqueeze(0), mask=mask_tensor.unsqueeze(0))[0]  # (81, 9)
+            # Get model predictions
+            logits = policy(x.unsqueeze(0))[0]  # (81, 9)
+
+            # Apply legal move mask
+            logits = logits.masked_fill(mask_tensor == 0, -1e9)
 
             # Apply temperature and compute probabilities
             logits = logits / temperature
