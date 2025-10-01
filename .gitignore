@@ -13,6 +13,7 @@ build/
 .venv/
 venv/
 .env
+.github/
 
 # Tools / caches
 .pytest_cache/
@@ -31,3 +32,10 @@ logs/
 checkpoints/
 .pytest_cache
 *info/
+dataset/
+*.jsonl
+*.log
+coverage.xml
+htmlcov/
+*.cover
+nul
