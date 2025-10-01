@@ -124,14 +124,16 @@ class SimplePolicyNet(nn.Module):
             nn.Linear(c // 2, 9),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass without masking.
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass with optional constraint-aware masking.
 
         Args:
             x: (B, 10, 9, 9) one-hot encoded board
+            mask: Optional (B, 81, 9) legal move mask (1=legal, 0=illegal)
 
         Returns:
-            logits: (B, 81, 9) raw logits for all (cell, digit) pairs
+            logits: (B, 81, 9) logits for all (cell, digit) pairs
+                   If mask provided, illegal moves get very low logits
         """
         # Extract local features
         z = self.input_conv(x)  # (B, C, 9, 9)
@@ -146,6 +148,11 @@ class SimplePolicyNet(nn.Module):
 
         # Generate logits
         logits = self.head(z)  # (B, 81, 9)
+
+        # Apply mask if provided (makes model constraint-aware during training)
+        if mask is not None:
+            # Set illegal move logits to large negative value
+            logits = torch.where(mask > 0, logits, torch.tensor(-1e9, device=logits.device, dtype=logits.dtype))
 
         return logits
 
@@ -380,12 +387,12 @@ def train_supervised(
 
             if train:
                 opt.zero_grad()
-                # Get raw logits - NO MASKING during training!
-                logits = model(xb)  # (B, 81, 9)
+                # Pass mask to model - teach it constraint awareness!
+                logits = model(xb, mask=mb)  # (B, 81, 9)
 
-                # Compute loss on raw logits
+                # Compute loss on masked logits
                 # CrossEntropyLoss ignores positions where yb == -100
-                # This is the correct way - let the model learn naturally
+                # Model learns to output high logits for legal moves
                 loss = criterion(logits.view(-1, 9), yb.view(-1))
 
                 # Check for invalid loss
@@ -401,7 +408,7 @@ def train_supervised(
                 opt.step()
             else:
                 with torch.no_grad():
-                    logits = model(xb)
+                    logits = model(xb, mask=mb)
                     loss = criterion(logits.view(-1, 9), yb.view(-1))
 
             tot_loss += float(loss.detach().item()) * xb.size(0)
@@ -412,15 +419,14 @@ def train_supervised(
                 count = mask.sum().item()
                 tot_count += int(count)
 
-                # Unmasked accuracy: True measure of learning
-                pred_unmasked = torch.argmax(logits, dim=-1)  # (B,81)
+                # Unmasked accuracy: Get raw predictions without constraints
+                logits_raw = model(xb, mask=None)  # No mask - pure model prediction
+                pred_unmasked = torch.argmax(logits_raw, dim=-1)  # (B,81)
                 correct_unmasked = (pred_unmasked.eq(yb) & mask).sum().item()
                 tot_correct_unmasked += int(correct_unmasked)
 
-                # Masked accuracy: What we use at inference
-                masked_logits = logits.clone()
-                masked_logits[mb == 0] = -1e9
-                pred_masked = torch.argmax(masked_logits, dim=-1)  # (B,81)
+                # Masked accuracy: Use constraint-aware predictions (from logits above)
+                pred_masked = torch.argmax(logits, dim=-1)  # (B,81) - already masked
                 correct_masked = (pred_masked.eq(yb) & mask).sum().item()
                 tot_correct_masked += int(correct_masked)
 
@@ -436,23 +442,23 @@ def train_supervised(
     xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
 
     with torch.no_grad():
-        logits = model(xb)
-        logger.info(f"   Sample logits range: [{logits.min().item():.2f}, {logits.max().item():.2f}]")
+        logits_masked = model(xb, mask=mb)
+        logits_raw = model(xb, mask=None)
+        logger.info(f"   Sample logits range (raw): [{logits_raw.min().item():.2f}, {logits_raw.max().item():.2f}]")
+        logger.info(f"   Sample logits range (masked): [{logits_masked.min().item():.2f}, {logits_masked.max().item():.2f}]")
         logger.info(f"   Sample targets: {(yb >= 0).sum().item()} valid positions")
         logger.info(f"   Legal moves per sample: {mb.sum(dim=[1,2]).cpu().numpy()}")
 
-        # Test loss on RAW logits (correct approach)
-        test_loss = criterion(logits.view(-1, 9), yb.view(-1))
-        logger.info(f"   Sample loss (raw logits): {test_loss.item():.4f}")
+        # Test loss on masked logits (new approach)
+        test_loss = criterion(logits_masked.view(-1, 9), yb.view(-1))
+        logger.info(f"   Sample loss (masked logits): {test_loss.item():.4f}")
 
         if not torch.isfinite(test_loss):
             logger.error("❌ Pre-training check failed: non-finite loss!")
             raise RuntimeError("Model initialization produced invalid loss")
 
-        # Also check masked accuracy
-        masked_logits = logits.clone()
-        masked_logits[mb == 0] = -1e9
-        pred = torch.argmax(masked_logits, dim=-1)
+        # Check masked accuracy
+        pred = torch.argmax(logits_masked, dim=-1)
         acc = (pred.eq(yb) & (yb >= 0)).sum().item() / (yb >= 0).sum().item()
         logger.info(f"   Sample accuracy (masked): {acc:.3f}")
 
