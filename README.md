@@ -81,16 +81,29 @@ sudoku train --dataset data/puzzles.jsonl --epochs 20
 sudoku train --help
 
 Options:
-  --dataset PATH        Path to JSONL dataset (required)
-  --output PATH         Output checkpoint path (default: checkpoints/policy.pt)
+  --dataset PATH        Path to JSONL dataset
+  --puzzles PATH        Path to puzzles file
+  --output PATH         Output checkpoint (default: checkpoints/policy.pt)
   --epochs N            Number of epochs (default: 10)
   --batch-size N        Batch size (default: 64)
   --lr FLOAT            Learning rate (default: 0.001)
   --val-split FLOAT     Validation split (default: 0.1)
-  --max-samples N       Limit training samples
+  --max-samples N       Limit samples (RECOMMENDED for large datasets!)
   --no-augment          Disable data augmentation
   --seed N              Random seed (default: 42)
+  --verbose             Debug logging
 ```
+
+**⚠️ IMPORTANT: For large datasets (100k+ puzzles), ALWAYS use `--max-samples`:**
+```bash
+# Don't do this (will process ALL puzzles - takes hours!)
+sudoku train --dataset huge_dataset.jsonl --epochs 10
+
+# Do this instead (much faster - ~15 min)
+sudoku train --dataset huge_dataset.jsonl --epochs 10 --max-samples 20000
+```
+
+See [LARGE_DATASET_GUIDE.md](LARGE_DATASET_GUIDE.md) for details.
 
 ### 2. Solve Puzzles
 
