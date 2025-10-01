@@ -89,7 +89,7 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             logger.info(f"✅ Puzzle completed in {moves_made} steps!")
             break
 
-        # Get model prediction
+        # Encode current board state
         line = board_to_line(b.grid)
         x = board_to_tensor(line).to(device)
 
@@ -98,6 +98,7 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             masks = b.candidates_mask()
             mask_tensor = torch.zeros(81, 9, device=device)
 
+            num_legal_moves = 0
             for idx in range(81):
                 r, c = divmod(idx, 9)
                 if b.grid[r, c] != 0:
@@ -105,50 +106,61 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
 
                 m = int(masks[r, c])
                 if m == 0:
-                    continue  # No legal moves
+                    continue  # No legal moves for this cell
 
                 for d in range(1, 10):
                     if m & (1 << (d - 1)):
                         mask_tensor[idx, d - 1] = 1.0
+                        num_legal_moves += 1
 
-            # Pass mask to model for constraint-aware predictions
-            logits = policy(x.unsqueeze(0), mask=mask_tensor.unsqueeze(0))[0]  # (81, 9)
-            logits = logits / temperature
-            probs = torch.softmax(logits, dim=-1)
+            # Check if any legal moves exist
+            if num_legal_moves == 0:
+                filled = sum(1 for i in range(81) if b.grid[divmod(i, 9)] != 0)
+                logger.error(f"No legal moves at step {step + 1} ({filled}/81 cells filled)")
+                console.print(f"❌ No legal moves available at step {step + 1} ({filled}/81 cells filled)", style="red")
+                console.print(f"💡 The puzzle may be unsolvable or the model made an error earlier.", style="yellow")
+                raise SystemExit(1)
 
-        logger.debug(f"Step {step+1}: Got NN predictions (temp={temperature:.3f})")
+            # Get model predictions (raw logits)
+            logits = policy(x.unsqueeze(0))[0]  # (81, 9)
 
-        # Explicitly zero out illegal moves to prevent numerical issues with multinomial
-        # Model masked them to -1e9, but after softmax they might be ~1e-billions, not exactly 0
-        probs = probs * mask_tensor
-        flat = probs.view(-1)
-        total = float(flat.sum().item())
+            # Apply legal move mask to logits
+            masked_logits = logits.clone()
+            masked_logits[mask_tensor == 0] = -float('inf')
 
-        if total <= 0.0:
-            filled = sum(1 for i in range(81) if b.grid[divmod(i, 9)] != 0)
-            logger.error(f"No legal moves at step {step + 1} ({filled}/81 cells filled)")
-            console.print(f"❌ No legal moves at step {step + 1} ({filled}/81 cells filled)", style="red")
-            console.print(f"💡 The model got stuck. Try:", style="yellow")
-            console.print(f"   - Using a lower temperature (--temperature 0.5)", style="yellow")
-            console.print(f"   - Using the best checkpoint (--ckpt checkpoints/policy_best.pt)", style="yellow")
-            console.print(f"   - Retraining with more data", style="yellow")
-            raise SystemExit(1)
+            # Apply temperature and compute probabilities
+            masked_logits = masked_logits / temperature
+            probs = torch.softmax(masked_logits, dim=-1)
 
-        # Sample move from legal moves only
-        dist = flat / flat.sum()
+            # Explicitly zero out illegal moves for numerical safety
+            probs = probs * mask_tensor
+            flat = probs.view(-1)
+            total = float(flat.sum().item())
+
+            # Normalize to valid probability distribution
+            if total > 0:
+                dist = flat / total
+            else:
+                # Fallback: uniform over legal moves
+                logger.warning(f"Step {step+1}: Probability sum is zero, using uniform distribution")
+                dist = mask_tensor.view(-1) / mask_tensor.sum()
+
+        logger.debug(f"Step {step+1}: Sampling from {num_legal_moves} legal moves (temp={temperature:.3f})")
+
+        # Sample move
         choice = int(torch.multinomial(dist, num_samples=1).item())
         cell, dig_idx = divmod(choice, 9)
         r, c = divmod(cell, 9)
         d = dig_idx + 1
 
-        # Verify move is legal before placing (safety check)
+        # Safety checks
         if (r, c) in original_cells:
             logger.error(f"Step {step+1}: CRITICAL - Attempted to overwrite ORIGINAL puzzle cell R{r+1}C{c+1}={board.grid[r,c]}")
             console.print(f"❌ CRITICAL ERROR: Tried to overwrite original puzzle cell!", style="red bold")
             raise SystemExit(1)
 
         if b.grid[r, c] != 0:
-            logger.error(f"Step {step+1}: Attempted to overwrite pre-filled cell R{r+1}C{c+1}={b.grid[r,c]}")
+            logger.error(f"Step {step+1}: Attempted to overwrite filled cell R{r+1}C{c+1}={b.grid[r,c]}")
             console.print(f"❌ Error: Tried to overwrite a filled cell", style="red")
             raise SystemExit(1)
 
