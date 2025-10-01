@@ -330,7 +330,36 @@ def train_supervised(
         avg_acc = tot_correct / tot_count if tot_count > 0 else 0.0
         return avg_loss, avg_acc
 
-    # 5) Training loop
+    # 5) Sanity check - verify training isn't trivial
+    logger.info("🔍 Running sanity check on sample batch...")
+    sample_loader = DataLoader(train_ds, batch_size=32, shuffle=False)
+    xb, yb, mb = next(iter(sample_loader))
+    xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
+
+    # Check that masks have multiple legal moves (not trivial)
+    num_legal_per_sample = mb.sum(dim=[1, 2]).cpu().numpy()
+    avg_legal_moves = num_legal_per_sample.mean()
+    logger.info(f"   Average legal moves per sample: {avg_legal_moves:.1f}")
+
+    if avg_legal_moves < 5:
+        logger.warning("⚠️ Very few legal moves per sample - training may be too easy!")
+
+    # Check untrained model accuracy
+    with torch.no_grad():
+        logits = model(xb)
+        logits_masked = logits.masked_fill(mb == 0, -1e9)
+        pred = torch.argmax(logits_masked, dim=-1)
+        mask = (yb >= 0)
+        untrained_acc = (pred.eq(yb) & mask).sum().item() / mask.sum().item()
+        logger.info(f"   Untrained model accuracy: {untrained_acc:.3f} (should be ~0.11 for 9-class random)")
+
+    if untrained_acc > 0.5:
+        logger.error("❌ Untrained model has >50% accuracy - task is too easy or data is leaking!")
+        raise RuntimeError("Training data is too easy - model doesn't need to learn")
+
+    logger.info("✅ Sanity check passed")
+
+    # 6) Training loop
     logger.info(f"🎯 Training {epochs} epochs...")
     print(f"\n{'='*60}")
     print(f"🎯 Training: {epochs} epochs, {len(train_ds)} samples")
