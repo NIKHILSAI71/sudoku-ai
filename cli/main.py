@@ -6,6 +6,7 @@ import logging
 from rich.console import Console
 
 from sudoku_engine import Board, parse_line, board_to_line
+from sudoku_engine.board import mask_to_digits
 from ui.tui import render_pretty
 
 console = Console()
@@ -70,57 +71,91 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
     logger.info(f"Starting AI solving loop (max_steps={args.max_steps}, temperature={args.temperature})")
 
     b = board.copy()
-    temperature = max(0.01, float(args.temperature))
+    initial_temperature = max(0.01, float(args.temperature))
+    temperature = initial_temperature
     moves_made = 0
+
+    # Track original puzzle cells to ensure we never modify them
+    original_cells = set()
+    for i in range(81):
+        r, c = divmod(i, 9)
+        if board.grid[r, c] != 0:
+            original_cells.add((r, c))
+
+    logger.info(f"Original puzzle has {len(original_cells)} pre-filled cells")
 
     for step in range(args.max_steps):
         if b.is_complete():
-            logger.info(f"✅ Puzzle completed in {step} steps!")
+            logger.info(f"✅ Puzzle completed in {moves_made} steps!")
             break
 
         # Get model prediction
         line = board_to_line(b.grid)
-        x = board_to_tensor(line).unsqueeze(0).to(device)
+        x = board_to_tensor(line).to(device)
 
         with torch.no_grad():
-            logits = policy(x)[0]  # (81, 9)
+            # Get legal move mask for this board state
+            masks = b.candidates_mask()
+            mask_tensor = torch.zeros(81, 9, device=device)
+
+            for idx in range(81):
+                r, c = divmod(idx, 9)
+                if b.grid[r, c] != 0:
+                    continue  # Already filled
+
+                m = int(masks[r, c])
+                if m == 0:
+                    continue  # No legal moves
+
+                for d in range(1, 10):
+                    if m & (1 << (d - 1)):
+                        mask_tensor[idx, d - 1] = 1.0
+
+            # Pass mask to model for constraint-aware predictions
+            logits = policy(x.unsqueeze(0), mask=mask_tensor.unsqueeze(0))[0]  # (81, 9)
             logits = logits / temperature
             probs = torch.softmax(logits, dim=-1)
 
-        logger.debug(f"Step {step+1}: Got NN predictions")
+        logger.debug(f"Step {step+1}: Got NN predictions (temp={temperature:.3f})")
 
-        # Create legal move mask
-        masks = b.candidates_mask()
-        mask_tensor = torch.zeros(81, 9, device=probs.device)
-
-        for idx in range(81):
-            r, c = divmod(idx, 9)
-            if b.grid[r, c] != 0:
-                continue  # Already filled
-
-            m = int(masks[r, c])
-            if m == 0:
-                continue  # No legal moves
-
-            for d in range(1, 10):
-                if m & (1 << (d - 1)):
-                    mask_tensor[idx, d - 1] = 1.0
-
-        # Apply mask and sample
+        # Apply mask to probabilities to ensure only legal moves are sampled
         masked_probs = probs * mask_tensor
         flat = masked_probs.view(-1)
         total = float(flat.sum().item())
 
         if total <= 0.0:
-            console.print(f"❌ No legal moves at step {step + 1}", style="red")
+            filled = sum(1 for i in range(81) if b.grid[divmod(i, 9)] != 0)
+            logger.error(f"No legal moves at step {step + 1} ({filled}/81 cells filled)")
+            console.print(f"❌ No legal moves at step {step + 1} ({filled}/81 cells filled)", style="red")
+            console.print(f"💡 The model got stuck. Try:", style="yellow")
+            console.print(f"   - Using a lower temperature (--temperature 0.5)", style="yellow")
+            console.print(f"   - Using the best checkpoint (--ckpt checkpoints/policy_best.pt)", style="yellow")
+            console.print(f"   - Retraining with more data", style="yellow")
             raise SystemExit(1)
 
-        # Sample move
+        # Sample move from legal moves only
         dist = flat / flat.sum()
         choice = int(torch.multinomial(dist, num_samples=1).item())
         cell, dig_idx = divmod(choice, 9)
         r, c = divmod(cell, 9)
         d = dig_idx + 1
+
+        # Verify move is legal before placing (safety check)
+        if (r, c) in original_cells:
+            logger.error(f"Step {step+1}: CRITICAL - Attempted to overwrite ORIGINAL puzzle cell R{r+1}C{c+1}={board.grid[r,c]}")
+            console.print(f"❌ CRITICAL ERROR: Tried to overwrite original puzzle cell!", style="red bold")
+            raise SystemExit(1)
+
+        if b.grid[r, c] != 0:
+            logger.error(f"Step {step+1}: Attempted to overwrite pre-filled cell R{r+1}C{c+1}={b.grid[r,c]}")
+            console.print(f"❌ Error: Tried to overwrite a filled cell", style="red")
+            raise SystemExit(1)
+
+        m = int(masks[r, c])
+        if not (m & (1 << (d - 1))):
+            logger.error(f"Step {step+1}: Illegal move {d} at R{r+1}C{c+1} (candidates: {mask_to_digits(m)})")
+            console.print(f"❌ Error: Illegal move attempted", style="red")
+            raise SystemExit(1)
 
         # Make move
         b.set_cell(r, c, d)
@@ -141,10 +176,25 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
         console.print(f"❌ Did not complete within {args.max_steps} steps ({filled}/81 filled)", style="red")
         raise SystemExit(1)
 
+    # Validate solution
+    from sudoku_engine.validator import is_valid_board
+
+    if not is_valid_board(b):
+        logger.error("Solution is INVALID - contains duplicates!")
+        console.print("❌ Solution is INVALID - contains duplicates!", style="red bold")
+        raise SystemExit(1)
+
+    # Verify original cells were not modified
+    for r, c in original_cells:
+        if b.grid[r, c] != board.grid[r, c]:
+            logger.error(f"CRITICAL: Original cell R{r+1}C{c+1} was modified!")
+            console.print(f"❌ CRITICAL: Original puzzle was modified!", style="red bold")
+            raise SystemExit(1)
+
     # Output solution
     solution = board_to_line(b.grid)
-    logger.info(f"✅ Solution found in {moves_made} moves!")
-    console.print(f"\n✅ Solution found in {moves_made} moves!", style="green bold")
+    logger.info(f"✅ Valid solution found in {moves_made} moves!")
+    console.print(f"\n✅ Valid solution found in {moves_made} moves!", style="green bold")
     console.print(solution)
 
     if args.pretty:
@@ -174,7 +224,12 @@ def cmd_train(args: argparse.Namespace) -> None:
     console.print(f"  Dataset: {args.dataset or args.puzzles or 'N/A'}")
     console.print(f"  Epochs: {args.epochs}")
     console.print(f"  Batch size: {args.batch_size}")
+    console.print(f"  Max samples: {args.max_samples or 'unlimited (will use all data)'}")
     console.print(f"  Output: {args.output}")
+
+    # Helpful tip for large datasets
+    if args.max_samples is None:
+        console.print("\n💡 [yellow]Tip: For large datasets, use --max-samples to limit training data (e.g., --max-samples 20000)[/yellow]")
 
     # Load puzzles from file if provided
     puzzles_list = None
@@ -324,7 +379,7 @@ def main() -> None:
     train_parser.add_argument(
         "--max-samples",
         type=int,
-        help="Maximum training samples to use"
+        help="Maximum training samples (recommended: 10000-50000 for large datasets)"
     )
     train_parser.add_argument(
         "--no-augment",
