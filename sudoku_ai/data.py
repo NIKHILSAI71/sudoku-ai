@@ -107,14 +107,13 @@ def read_puzzles(paths: Iterable[str]) -> List[str]:
 
 def make_partial_samples(puzzle: str, solution: str, steps: int = 40) -> List[Tuple[str, np.ndarray]]:
     """
-    Create a sequence of (partial_board_line, targets) pairs from a full solution.
-    Uses intelligent ordering to teach logical solving strategies:
-    1. Naked singles (cells with only one candidate)
-    2. Hidden singles (digits with only one position in row/col/box)
-    3. Random logical moves
+    Create training samples from puzzle-solution pair.
 
-    - targets is an (81,) int array with -100 everywhere except for the one cell to be filled,
-      which has the target digit (0..8).
+    Strategy: Pick RANDOM valid moves from solution (not always easiest moves).
+    This forces the model to learn good move selection, not just trivial deductions.
+
+    Returns list of (board_state, target) pairs where target indicates
+    which cell to fill with which digit.
     """
     g_puz = parse_line(puzzle)
     g_sol = parse_line(solution)
@@ -122,66 +121,34 @@ def make_partial_samples(puzzle: str, solution: str, steps: int = 40) -> List[Tu
     samples: List[Tuple[str, np.ndarray]] = []
     cur = g_puz.copy()
 
-    # Create samples by filling cells strategically
+    # Fill cells randomly from solution (force learning, not trivial deduction)
     filled_count = 0
-    max_attempts = steps * 3  # Prevent infinite loops
+    max_attempts = steps * 3
 
     for attempt in range(max_attempts):
         if filled_count >= steps:
             break
 
-        # Find logical moves using candidate analysis
+        # Find all empty cells
+        empty_cells = [(r, c) for r in range(9) for c in range(9) if cur[r, c] == 0]
+        if not empty_cells:
+            break
+
+        # Pick a random empty cell from solution
+        r, c = random.choice(empty_cells)
+        digit = g_sol[r, c]
+
+        # Verify this is a legal move
         b = Board(cur)
         candidates_mask = b.candidates_mask()
+        mask_val = int(candidates_mask[r, c])
 
-        # Priority 1: Naked singles (cells with only one candidate)
-        naked_singles = []
-        for r in range(9):
-            for c in range(9):
-                if cur[r, c] == 0:
-                    mask = int(candidates_mask[r, c])
-                    if mask > 0:
-                        num_candidates = bin(mask).count('1')
-                        if num_candidates == 1:
-                            # Find the single candidate
-                            for d in range(1, 10):
-                                if mask & (1 << (d - 1)):
-                                    naked_singles.append((r, c, d))
-                                    break
+        # Check if this move is legal
+        if not (mask_val & (1 << (digit - 1))):
+            # Not legal, skip (shouldn't happen with valid solution)
+            continue
 
-        # Priority 2: Hidden singles (digit has only one position in row/col/box)
-        hidden_singles = []
-        if not naked_singles:
-            for r in range(9):
-                for d in range(1, 10):
-                    positions = []
-                    for c in range(9):
-                        if cur[r, c] == 0:
-                            mask = int(candidates_mask[r, c])
-                            if mask & (1 << (d - 1)):
-                                positions.append((r, c))
-                    if len(positions) == 1:
-                        hidden_singles.append((positions[0][0], positions[0][1], d))
-
-        # Choose move: prefer logical moves
-        move_to_make = None
-        if naked_singles:
-            move_to_make = random.choice(naked_singles)
-        elif hidden_singles:
-            move_to_make = random.choice(hidden_singles)
-        else:
-            # Fallback: pick any valid move from solution
-            empty_cells = [(r, c) for r in range(9) for c in range(9) if cur[r, c] == 0]
-            if empty_cells:
-                r, c = random.choice(empty_cells)
-                move_to_make = (r, c, g_sol[r, c])
-
-        if move_to_make is None:
-            break  # No more moves possible
-
-        r, c, digit = move_to_make
-
-        # Create training sample
+        # Create training sample BEFORE making the move
         current_line = _line_from_grid(cur)
         idx_to_fill = r * 9 + c
 
@@ -190,7 +157,7 @@ def make_partial_samples(puzzle: str, solution: str, steps: int = 40) -> List[Tu
 
         samples.append((current_line, targets))
 
-        # Apply the move
+        # Apply the move for next iteration
         cur[r, c] = digit
         filled_count += 1
 
