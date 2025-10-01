@@ -121,19 +121,14 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
                 console.print(f"💡 The puzzle may be unsolvable or the model made an error earlier.", style="yellow")
                 raise SystemExit(1)
 
-            # Get model predictions (raw logits)
-            logits = policy(x.unsqueeze(0))[0]  # (81, 9)
-
-            # Apply legal move mask to logits
-            masked_logits = logits.clone()
-            masked_logits[mask_tensor == 0] = -float('inf')
+            # Get model predictions with constraint awareness (pass mask)
+            logits = policy(x.unsqueeze(0), mask=mask_tensor.unsqueeze(0))[0]  # (81, 9)
 
             # Apply temperature and compute probabilities
-            masked_logits = masked_logits / temperature
-            probs = torch.softmax(masked_logits, dim=-1)
+            logits = logits / temperature
+            probs = torch.softmax(logits, dim=-1)
 
-            # Explicitly zero out illegal moves for numerical safety
-            probs = probs * mask_tensor
+            # Flatten to get distribution over all (cell, digit) pairs
             flat = probs.view(-1)
             total = float(flat.sum().item())
 
@@ -141,7 +136,7 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
             if total > 0:
                 dist = flat / total
             else:
-                # Fallback: uniform over legal moves
+                # Fallback: uniform over legal moves (shouldn't happen now)
                 logger.warning(f"Step {step+1}: Probability sum is zero, using uniform distribution")
                 dist = mask_tensor.view(-1) / mask_tensor.sum()
 
