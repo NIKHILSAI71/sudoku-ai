@@ -18,6 +18,14 @@ def _no_duplicates(vals: np.ndarray) -> bool:
     return True
 
 
+def has_duplicates(vals: np.ndarray) -> bool:
+    """Check if array has duplicate non-zero values.
+
+    Returns True if duplicates found, False otherwise.
+    """
+    return not _no_duplicates(vals)
+
+
 def is_valid_board(board: Board) -> bool:
     g = board.grid
     for r in range(9):
