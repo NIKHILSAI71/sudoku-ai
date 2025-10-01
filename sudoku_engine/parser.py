@@ -24,6 +24,18 @@ def parse_line(s: str) -> np.ndarray:
     return arr
 
 
+def parse_sdk(s: str) -> np.ndarray:
+    """Parse SDK format with optional box separators and formatting.
+
+    Accepts formats like:
+    - Simple grid with spaces
+    - Grid with | and - separators
+    - . or 0 for empty cells
+    """
+    # Just use parse_line which handles all these cases
+    return parse_line(s)
+
+
 def board_to_line(arr: np.ndarray) -> str:
     if arr.shape != (9, 9):
         raise ValueError("expected (9,9)")
