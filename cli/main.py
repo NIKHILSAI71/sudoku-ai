@@ -269,13 +269,16 @@ def cmd_train(args: argparse.Namespace) -> None:
             augment=args.augment,
             seed=args.seed,
         )
-        console.print(f"\n✅ Training complete! Model saved to: {args.output}", style="green bold")
-
+        # Training complete message already printed by policy.py
         history = result.get("history", {})
         if history.get("val_loss"):
             final_loss = history["val_loss"][-1]
-            final_acc = history["val_acc"][-1]
-            console.print(f"📊 Final val_loss: {final_loss:.4f}, val_acc: {final_acc:.3f}")
+            final_acc_unmask = history.get("val_acc_unmasked", [0])[-1]
+            final_acc_mask = history.get("val_acc_masked", [0])[-1]
+            console.print(f"\n📈 Training Summary:", style="bold")
+            console.print(f"   Final loss: {final_loss:.4f}")
+            console.print(f"   Unmasked accuracy: {final_acc_unmask:.3f} (model learning)")
+            console.print(f"   Masked accuracy: {final_acc_mask:.3f} (with constraints)")
 
     except Exception as e:
         console.print(f"❌ Training failed: {e}", style="red")
