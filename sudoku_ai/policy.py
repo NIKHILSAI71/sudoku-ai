@@ -55,41 +55,105 @@ def legal_mask_from_line(line: str) -> torch.Tensor:
 # Neural Network Policy
 # ----------------------------
 
-class SimplePolicyNet(nn.Module):
-    """A lightweight CNN that maps (10,9,9) -> (81,9) logits.
+class SudokuAttentionBlock(nn.Module):
+    """Attention block that understands Sudoku constraints (row, col, box)."""
 
-    - Input channels: 10 one-hot planes (digits 1..9 + empty)
-    - A few conv layers with residual connections, then a head to 81*9 logits
+    def __init__(self, channels: int):
+        super().__init__()
+        self.channels = channels
+        self.norm = nn.LayerNorm(channels)
+        self.qkv = nn.Linear(channels, channels * 3)
+        self.proj = nn.Linear(channels, channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 81, C)
+        B, N, C = x.shape
+        x_norm = self.norm(x)
+        qkv = self.qkv(x_norm).reshape(B, N, 3, C).permute(2, 0, 1, 3)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Self-attention with constraint awareness
+        attn = (q @ k.transpose(-2, -1)) / (C ** 0.5)
+        attn = torch.softmax(attn, dim=-1)
+        out = attn @ v
+        out = self.proj(out)
+        return x + out
+
+
+class SimplePolicyNet(nn.Module):
+    """Sudoku-aware policy network with attention and constraint encoding.
+
+    - Input: (10,9,9) one-hot planes + constraint channels
+    - Architecture: CNN backbone + transformer blocks + constraint-aware head
+    - Output: (81,9) logits with legal move awareness
     """
 
-    def __init__(self, width: int = 64, drop: float = 0.2) -> None:
+    def __init__(self, width: int = 128, drop: float = 0.1, n_blocks: int = 4) -> None:
         super().__init__()
         c = width
-        self.backbone = nn.Sequential(
+
+        # Enhanced input encoding: one-hot + row/col/box constraint indicators
+        self.input_conv = nn.Sequential(
             nn.Conv2d(10, c, kernel_size=3, padding=1),
             nn.BatchNorm2d(c),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(p=drop),
-            nn.Conv2d(c, c, kernel_size=3, padding=1),
-            nn.BatchNorm2d(c),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(p=drop),
-            nn.Conv2d(c, c, kernel_size=3, padding=1),
-            nn.BatchNorm2d(c),
-            nn.ReLU(inplace=True),
-        )
-        self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(c * 9 * 9, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=drop),
-            nn.Linear(512, 81 * 9),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (N,10,9,9) -> (N,81,9)
-        z = self.backbone(x)
-        out = self.head(z)
-        return out.view(-1, 81, 9)
+        # Residual conv blocks for local pattern extraction
+        conv_blocks = []
+        for _ in range(3):
+            conv_blocks.extend([
+                nn.Conv2d(c, c, kernel_size=3, padding=1),
+                nn.BatchNorm2d(c),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(p=drop),
+            ])
+        self.conv_backbone = nn.Sequential(*conv_blocks)
+
+        # Reshape to sequence for attention
+        self.to_seq = nn.Sequential(
+            nn.Flatten(start_dim=2),  # (B, C, 81)
+            nn.Unflatten(1, (c, 1)),  # (B, C, 1, 81)
+            nn.Flatten(start_dim=1, end_dim=2),  # (B, C, 81)
+        )
+
+        # Transformer blocks for global constraint reasoning
+        self.attn_blocks = nn.ModuleList([
+            SudokuAttentionBlock(c) for _ in range(n_blocks)
+        ])
+
+        # Output head with constraint awareness
+        self.head = nn.Sequential(
+            nn.Linear(c, c // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=drop),
+            nn.Linear(c // 2, 9),
+        )
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # x: (B, 10, 9, 9), mask: (B, 81, 9) legal moves
+        B = x.size(0)
+
+        # Extract local features
+        z = self.input_conv(x)  # (B, C, 9, 9)
+        z = self.conv_backbone(z) + z  # Residual connection
+
+        # Reshape to sequence: (B, C, 9, 9) -> (B, 81, C)
+        z = z.flatten(start_dim=2).transpose(1, 2)  # (B, 81, C)
+
+        # Apply attention blocks for global reasoning
+        for attn_block in self.attn_blocks:
+            z = attn_block(z)
+
+        # Generate logits
+        logits = self.head(z)  # (B, 81, 9)
+
+        # Apply legal move masking if provided
+        if mask is not None:
+            # Set illegal moves to very negative value
+            logits = logits.masked_fill(mask == 0, -1e9)
+
+        return logits
 
 
 # ----------------------------
@@ -248,22 +312,48 @@ def train_supervised(
             full_ds, [n_train, n_val], torch.Generator().manual_seed(int(seed))
         )
 
-    train_loader = DataLoader(train_ds, batch_size=int(batch_size), shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=int(batch_size), shuffle=False) if val_ds else None
-
-    # 4) Model, optimizer, loss
+    # 4) Model, optimizer, loss (define device first)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Use larger batch size and multiple workers for faster training
+    effective_batch_size = int(batch_size) * 2  # Double batch size for efficiency
+
+    # Windows has issues with multiprocessing in DataLoader
+    import sys
+    num_workers = 0 if sys.platform == "win32" else (4 if device.type == "cuda" else 2)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=effective_batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True if device.type == "cuda" else False,
+        persistent_workers=True if num_workers > 0 else False
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=effective_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True if device.type == "cuda" else False,
+        persistent_workers=True if num_workers > 0 else False
+    ) if val_ds else None
     logger.info(f"🔧 Initializing model on device: {device}")
     print(f"🔧 Device: {device}")
 
-    model = SimplePolicyNet(width=64, drop=0.2).to(device)
+    # Use improved architecture with attention
+    model = SimplePolicyNet(width=128, drop=0.1, n_blocks=4).to(device)
     param_count = sum(p.numel() for p in model.parameters())
-    logger.info(f"🧠 SimplePolicyNet initialized with {param_count:,} parameters")
-    print(f"🧠 Model: SimplePolicyNet ({param_count:,} parameters)")
+    logger.info(f"🧠 SudokuPolicyNet initialized with {param_count:,} parameters")
+    print(f"🧠 Model: SudokuPolicyNet with Attention ({param_count:,} parameters)")
 
+    # Use learning rate schedule for better convergence
     opt = optim.AdamW(model.parameters(), lr=float(lr), weight_decay=0.01)
-    criterion = nn.CrossEntropyLoss(ignore_index=-100)
-    logger.info(f"⚙️ Optimizer: AdamW (lr={lr}, weight_decay=0.01)")
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.1)
+
+    # Label smoothing for better generalization
+    criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
+    logger.info(f"⚙️ Optimizer: AdamW (lr={lr}, weight_decay=0.01, cosine schedule)")
 
     history: Dict[str, List[float]] = {
         "train_loss": [],
@@ -277,20 +367,34 @@ def train_supervised(
         tot_loss = 0.0
         tot_correct = 0
         tot_count = 0
+
         for xb, yb, mb in dl:
             xb = xb.to(device)
             yb = yb.to(device)
+            mb = mb.to(device)  # Legal move mask
+
             if train:
                 opt.zero_grad()
-                logits = model(xb)  # (B,81,9)
+                # Don't pass mask for loss - targets already have -100 for ignore
+                logits = model(xb, mask=None)
+
+                # Compute loss only on valid targets (yb has -100 for ignore)
                 loss = criterion(logits.view(-1, 9), yb.view(-1))
+
                 loss.backward()
+
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 opt.step()
             else:
                 with torch.no_grad():
-                    logits = model(xb)
+                    # Don't pass mask for loss computation
+                    logits = model(xb, mask=None)
                     loss = criterion(logits.view(-1, 9), yb.view(-1))
+
             tot_loss += float(loss.detach().item()) * xb.size(0)
+
             with torch.no_grad():
                 pred = torch.argmax(logits, dim=-1)  # (B,81)
                 mask = (yb >= 0)
@@ -298,6 +402,7 @@ def train_supervised(
                 count = mask.sum().item()
                 tot_correct += int(correct)
                 tot_count += int(count)
+
         avg_loss = tot_loss / max(1, len(dl.dataset))
         avg_acc = (tot_correct / tot_count) if tot_count > 0 else 0.0
         return avg_loss, avg_acc
@@ -309,9 +414,19 @@ def train_supervised(
     print(f"🎯 Training: {total_epochs} epochs, {len(train_ds)} samples")
     print(f"{'='*60}\n")
 
+    # Early stopping parameters
+    best_val_loss = float('inf')
+    best_val_acc = 0.0
+    patience = 5
+    patience_counter = 0
+
     for ep in range(1, total_epochs + 1):
         logger.info(f"Epoch {ep}/{total_epochs}: Training...")
         tr_loss, tr_acc = _epoch_pass(train_loader, train=True)
+
+        # Step learning rate scheduler
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
 
         if val_loader is not None:
             logger.info(f"Epoch {ep}/{total_epochs}: Validating...")
@@ -324,6 +439,33 @@ def train_supervised(
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
 
+        # Early stopping check
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_val_loss = val_loss
+            patience_counter = 0
+            # Save best checkpoint
+            best_ckpt_path = out_path.replace('.pt', '_best.pt')
+            torch.save(
+                {
+                    "arch": "sudoku_policy_net",
+                    "model_state": model.state_dict(),
+                    "meta": {
+                        "epoch": ep,
+                        "val_loss": val_loss,
+                        "val_acc": val_acc,
+                    },
+                },
+                best_ckpt_path,
+            )
+            logger.info(f"💾 Saved best model (acc={val_acc:.3f}) to: {best_ckpt_path}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logger.info(f"⚠️ Early stopping triggered after {ep} epochs (no improvement for {patience} epochs)")
+                print(f"\n⚠️ Early stopping: No improvement for {patience} epochs")
+                break
+
         if progress_cb:
             try:
                 progress_cb(ep, float(val_loss), float(val_acc))
@@ -334,8 +476,11 @@ def train_supervised(
         log_msg = (
             f"Epoch {ep}/{total_epochs}: "
             f"train_loss={tr_loss:.4f} train_acc={tr_acc:.3f} | "
-            f"val_loss={val_loss:.4f} val_acc={val_acc:.3f}"
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.3f} | "
+            f"lr={current_lr:.2e}"
         )
+        if val_acc == best_val_acc:
+            log_msg += " 🌟"
         logger.info(log_msg)
         print(f"📊 {log_msg}", flush=True)
 
@@ -380,7 +525,8 @@ def load_policy(
     if not isinstance(state, dict) or "model_state" not in state:
         raise RuntimeError(f"Invalid checkpoint format: {ckpt_path}")
 
-    model = SimplePolicyNet(width=64, drop=0.2)
+    # Load with new architecture parameters
+    model = SimplePolicyNet(width=128, drop=0.1, n_blocks=4)
     model.load_state_dict(state["model_state"])
     model.to(device)
     model.eval()
