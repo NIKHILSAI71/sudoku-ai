@@ -375,8 +375,8 @@ def train_supervised(
 
             if train:
                 opt.zero_grad()
-                # Don't pass mask for loss - targets already have -100 for ignore
-                logits = model(xb, mask=None)
+                # Pass mask to model for constraint-aware training
+                logits = model(xb, mask=mb)
 
                 # Compute loss only on valid targets (yb has -100 for ignore)
                 loss = criterion(logits.view(-1, 9), yb.view(-1))
@@ -389,8 +389,8 @@ def train_supervised(
                 opt.step()
             else:
                 with torch.no_grad():
-                    # Don't pass mask for loss computation
-                    logits = model(xb, mask=None)
+                    # Pass mask to model for constraint-aware validation
+                    logits = model(xb, mask=mb)
                     loss = criterion(logits.view(-1, 9), yb.view(-1))
 
             tot_loss += float(loss.detach().item()) * xb.size(0)
