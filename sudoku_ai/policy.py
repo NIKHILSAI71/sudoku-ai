@@ -83,23 +83,24 @@ class SudokuAttentionBlock(nn.Module):
 class SimplePolicyNet(nn.Module):
     """Sudoku-aware policy network with attention and constraint encoding.
 
-    - Input: (10,9,9) one-hot planes + constraint channels
-    - Architecture: CNN backbone + transformer blocks + constraint-aware head
-    - Output: (81,9) logits with legal move awareness
+    - Input: (10,9,9) one-hot planes
+    - Architecture: CNN backbone + transformer blocks + output head
+    - Output: (81,9) logits for next move prediction
+    - Masking is applied externally, NOT in forward pass
     """
 
     def __init__(self, width: int = 128, drop: float = 0.1, n_blocks: int = 4) -> None:
         super().__init__()
         c = width
 
-        # Enhanced input encoding: one-hot + row/col/box constraint indicators
+        # Input encoding with constraint awareness
         self.input_conv = nn.Sequential(
             nn.Conv2d(10, c, kernel_size=3, padding=1),
             nn.BatchNorm2d(c),
             nn.ReLU(inplace=True),
         )
 
-        # Residual conv blocks for local pattern extraction
+        # Residual conv blocks for pattern extraction
         conv_blocks = []
         for _ in range(3):
             conv_blocks.extend([
@@ -110,19 +111,12 @@ class SimplePolicyNet(nn.Module):
             ])
         self.conv_backbone = nn.Sequential(*conv_blocks)
 
-        # Reshape to sequence for attention
-        self.to_seq = nn.Sequential(
-            nn.Flatten(start_dim=2),  # (B, C, 81)
-            nn.Unflatten(1, (c, 1)),  # (B, C, 1, 81)
-            nn.Flatten(start_dim=1, end_dim=2),  # (B, C, 81)
-        )
-
-        # Transformer blocks for global constraint reasoning
+        # Transformer blocks for global reasoning
         self.attn_blocks = nn.ModuleList([
             SudokuAttentionBlock(c) for _ in range(n_blocks)
         ])
 
-        # Output head with constraint awareness
+        # Output head
         self.head = nn.Sequential(
             nn.Linear(c, c // 2),
             nn.ReLU(inplace=True),
@@ -130,10 +124,15 @@ class SimplePolicyNet(nn.Module):
             nn.Linear(c // 2, 9),
         )
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # x: (B, 10, 9, 9), mask: (B, 81, 9) legal moves
-        B = x.size(0)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass without masking.
 
+        Args:
+            x: (B, 10, 9, 9) one-hot encoded board
+
+        Returns:
+            logits: (B, 81, 9) raw logits for all (cell, digit) pairs
+        """
         # Extract local features
         z = self.input_conv(x)  # (B, C, 9, 9)
         z = self.conv_backbone(z) + z  # Residual connection
@@ -147,11 +146,6 @@ class SimplePolicyNet(nn.Module):
 
         # Generate logits
         logits = self.head(z)  # (B, 81, 9)
-
-        # Apply legal move masking if provided
-        if mask is not None:
-            # Set illegal moves to very negative value
-            logits = logits.masked_fill(mask == 0, -1e9)
 
         return logits
 
@@ -363,6 +357,11 @@ def train_supervised(
     }
 
     def _epoch_pass(dl: DataLoader, train: bool) -> Tuple[float, float]:
+        """Run one epoch of training or validation.
+
+        Key insight: We compute loss on UNMASKED logits, but only for valid target positions.
+        This allows the model to learn natural move preferences without gradient issues.
+        """
         model.train(train)
         tot_loss = 0.0
         tot_correct = 0
@@ -371,15 +370,25 @@ def train_supervised(
         for xb, yb, mb in dl:
             xb = xb.to(device)
             yb = yb.to(device)
-            mb = mb.to(device)  # Legal move mask
+            mb = mb.to(device)  # Legal move mask (B, 81, 9)
 
             if train:
                 opt.zero_grad()
-                # Pass mask to model for constraint-aware training
-                logits = model(xb, mask=mb)
+                # Get raw logits without masking
+                logits = model(xb)  # (B, 81, 9)
+
+                # Apply mask to logits for stable training
+                # Only set illegal moves to -inf BEFORE loss computation
+                masked_logits = logits.clone()
+                masked_logits[mb == 0] = -1e9
 
                 # Compute loss only on valid targets (yb has -100 for ignore)
-                loss = criterion(logits.view(-1, 9), yb.view(-1))
+                loss = criterion(masked_logits.view(-1, 9), yb.view(-1))
+
+                # Check for invalid loss
+                if not torch.isfinite(loss):
+                    logger.error(f"Non-finite loss detected: {loss.item()}")
+                    continue
 
                 loss.backward()
 
@@ -389,14 +398,16 @@ def train_supervised(
                 opt.step()
             else:
                 with torch.no_grad():
-                    # Pass mask to model for constraint-aware validation
-                    logits = model(xb, mask=mb)
-                    loss = criterion(logits.view(-1, 9), yb.view(-1))
+                    logits = model(xb)
+                    masked_logits = logits.clone()
+                    masked_logits[mb == 0] = -1e9
+                    loss = criterion(masked_logits.view(-1, 9), yb.view(-1))
 
             tot_loss += float(loss.detach().item()) * xb.size(0)
 
+            # Compute accuracy on masked logits
             with torch.no_grad():
-                pred = torch.argmax(logits, dim=-1)  # (B,81)
+                pred = torch.argmax(masked_logits, dim=-1)  # (B,81)
                 mask = (yb >= 0)
                 correct = (pred.eq(yb) & mask).sum().item()
                 count = mask.sum().item()
@@ -407,7 +418,31 @@ def train_supervised(
         avg_acc = (tot_correct / tot_count) if tot_count > 0 else 0.0
         return avg_loss, avg_acc
 
-    # 5) Training loop
+    # 5) Pre-training validation: Check a sample batch
+    logger.info("🔍 Running pre-training validation on sample batch...")
+    sample_loader = DataLoader(train_ds, batch_size=4, shuffle=False)
+    xb, yb, mb = next(iter(sample_loader))
+    xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
+
+    with torch.no_grad():
+        logits = model(xb)
+        logger.info(f"   Sample logits range: [{logits.min().item():.2f}, {logits.max().item():.2f}]")
+        logger.info(f"   Sample targets: {(yb >= 0).sum().item()} valid positions")
+        logger.info(f"   Legal moves per sample: {mb.sum(dim=[1,2]).cpu().numpy()}")
+
+        # Test masked loss
+        masked_logits = logits.clone()
+        masked_logits[mb == 0] = -1e9
+        test_loss = criterion(masked_logits.view(-1, 9), yb.view(-1))
+        logger.info(f"   Sample loss: {test_loss.item():.4f}")
+
+        if not torch.isfinite(test_loss):
+            logger.error("❌ Pre-training check failed: non-finite loss!")
+            raise RuntimeError("Model initialization produced invalid loss")
+
+    logger.info("✅ Pre-training validation passed")
+
+    # 6) Training loop
     total_epochs = max(1, int(epochs))
     logger.info(f"🎯 Starting training for {total_epochs} epochs...")
     print(f"\n{'='*60}")
@@ -484,7 +519,7 @@ def train_supervised(
         logger.info(log_msg)
         print(f"📊 {log_msg}", flush=True)
 
-    # 6) Save checkpoint
+    # 7) Save checkpoint
     logger.info(f"💾 Saving model checkpoint to: {out_path}")
     print(f"\n💾 Saving model to: {out_path}")
 
