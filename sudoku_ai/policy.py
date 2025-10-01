@@ -351,20 +351,26 @@ def train_supervised(
 
     history: Dict[str, List[float]] = {
         "train_loss": [],
-        "train_acc": [],
+        "train_acc_unmasked": [],
+        "train_acc_masked": [],
         "val_loss": [],
-        "val_acc": []
+        "val_acc_unmasked": [],
+        "val_acc_masked": []
     }
 
-    def _epoch_pass(dl: DataLoader, train: bool) -> Tuple[float, float]:
+    def _epoch_pass(dl: DataLoader, train: bool) -> Tuple[float, float, float]:
         """Run one epoch of training or validation.
 
-        Key insight: We compute loss on UNMASKED logits, but only for valid target positions.
-        This allows the model to learn natural move preferences without gradient issues.
+        Key insight: Train on RAW logits, only mask for accuracy computation.
+        CrossEntropyLoss with ignore_index=-100 handles invalid positions automatically.
+
+        Returns:
+            (avg_loss, avg_acc_unmasked, avg_acc_masked)
         """
         model.train(train)
         tot_loss = 0.0
-        tot_correct = 0
+        tot_correct_masked = 0
+        tot_correct_unmasked = 0
         tot_count = 0
 
         for xb, yb, mb in dl:
@@ -374,16 +380,13 @@ def train_supervised(
 
             if train:
                 opt.zero_grad()
-                # Get raw logits without masking
+                # Get raw logits - NO MASKING during training!
                 logits = model(xb)  # (B, 81, 9)
 
-                # Apply mask to logits for stable training
-                # Only set illegal moves to -inf BEFORE loss computation
-                masked_logits = logits.clone()
-                masked_logits[mb == 0] = -1e9
-
-                # Compute loss only on valid targets (yb has -100 for ignore)
-                loss = criterion(masked_logits.view(-1, 9), yb.view(-1))
+                # Compute loss on raw logits
+                # CrossEntropyLoss ignores positions where yb == -100
+                # This is the correct way - let the model learn naturally
+                loss = criterion(logits.view(-1, 9), yb.view(-1))
 
                 # Check for invalid loss
                 if not torch.isfinite(loss):
@@ -399,24 +402,32 @@ def train_supervised(
             else:
                 with torch.no_grad():
                     logits = model(xb)
-                    masked_logits = logits.clone()
-                    masked_logits[mb == 0] = -1e9
-                    loss = criterion(masked_logits.view(-1, 9), yb.view(-1))
+                    loss = criterion(logits.view(-1, 9), yb.view(-1))
 
             tot_loss += float(loss.detach().item()) * xb.size(0)
 
-            # Compute accuracy on masked logits
+            # Compute accuracy: Both masked and unmasked
             with torch.no_grad():
-                pred = torch.argmax(masked_logits, dim=-1)  # (B,81)
                 mask = (yb >= 0)
-                correct = (pred.eq(yb) & mask).sum().item()
                 count = mask.sum().item()
-                tot_correct += int(correct)
                 tot_count += int(count)
 
+                # Unmasked accuracy: True measure of learning
+                pred_unmasked = torch.argmax(logits, dim=-1)  # (B,81)
+                correct_unmasked = (pred_unmasked.eq(yb) & mask).sum().item()
+                tot_correct_unmasked += int(correct_unmasked)
+
+                # Masked accuracy: What we use at inference
+                masked_logits = logits.clone()
+                masked_logits[mb == 0] = -1e9
+                pred_masked = torch.argmax(masked_logits, dim=-1)  # (B,81)
+                correct_masked = (pred_masked.eq(yb) & mask).sum().item()
+                tot_correct_masked += int(correct_masked)
+
         avg_loss = tot_loss / max(1, len(dl.dataset))
-        avg_acc = (tot_correct / tot_count) if tot_count > 0 else 0.0
-        return avg_loss, avg_acc
+        avg_acc_unmasked = (tot_correct_unmasked / tot_count) if tot_count > 0 else 0.0
+        avg_acc_masked = (tot_correct_masked / tot_count) if tot_count > 0 else 0.0
+        return avg_loss, avg_acc_unmasked, avg_acc_masked
 
     # 5) Pre-training validation: Check a sample batch
     logger.info("🔍 Running pre-training validation on sample batch...")
@@ -430,15 +441,20 @@ def train_supervised(
         logger.info(f"   Sample targets: {(yb >= 0).sum().item()} valid positions")
         logger.info(f"   Legal moves per sample: {mb.sum(dim=[1,2]).cpu().numpy()}")
 
-        # Test masked loss
-        masked_logits = logits.clone()
-        masked_logits[mb == 0] = -1e9
-        test_loss = criterion(masked_logits.view(-1, 9), yb.view(-1))
-        logger.info(f"   Sample loss: {test_loss.item():.4f}")
+        # Test loss on RAW logits (correct approach)
+        test_loss = criterion(logits.view(-1, 9), yb.view(-1))
+        logger.info(f"   Sample loss (raw logits): {test_loss.item():.4f}")
 
         if not torch.isfinite(test_loss):
             logger.error("❌ Pre-training check failed: non-finite loss!")
             raise RuntimeError("Model initialization produced invalid loss")
+
+        # Also check masked accuracy
+        masked_logits = logits.clone()
+        masked_logits[mb == 0] = -1e9
+        pred = torch.argmax(masked_logits, dim=-1)
+        acc = (pred.eq(yb) & (yb >= 0)).sum().item() / (yb >= 0).sum().item()
+        logger.info(f"   Sample accuracy (masked): {acc:.3f}")
 
     logger.info("✅ Pre-training validation passed")
 
@@ -457,7 +473,7 @@ def train_supervised(
 
     for ep in range(1, total_epochs + 1):
         logger.info(f"Epoch {ep}/{total_epochs}: Training...")
-        tr_loss, tr_acc = _epoch_pass(train_loader, train=True)
+        tr_loss, tr_acc_unmask, tr_acc_mask = _epoch_pass(train_loader, train=True)
 
         # Step learning rate scheduler
         scheduler.step()
@@ -465,18 +481,20 @@ def train_supervised(
 
         if val_loader is not None:
             logger.info(f"Epoch {ep}/{total_epochs}: Validating...")
-            val_loss, val_acc = _epoch_pass(val_loader, train=False)
+            val_loss, val_acc_unmask, val_acc_mask = _epoch_pass(val_loader, train=False)
         else:
-            val_loss, val_acc = tr_loss, tr_acc
+            val_loss, val_acc_unmask, val_acc_mask = tr_loss, tr_acc_unmask, tr_acc_mask
 
         history["train_loss"].append(tr_loss)
-        history["train_acc"].append(tr_acc)
+        history["train_acc_unmasked"].append(tr_acc_unmask)
+        history["train_acc_masked"].append(tr_acc_mask)
         history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
+        history["val_acc_unmasked"].append(val_acc_unmask)
+        history["val_acc_masked"].append(val_acc_mask)
 
-        # Early stopping check
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Early stopping check - use UNMASKED accuracy as true measure
+        if val_acc_unmask > best_val_acc:
+            best_val_acc = val_acc_unmask
             best_val_loss = val_loss
             patience_counter = 0
             # Save best checkpoint
@@ -488,12 +506,13 @@ def train_supervised(
                     "meta": {
                         "epoch": ep,
                         "val_loss": val_loss,
-                        "val_acc": val_acc,
+                        "val_acc_unmasked": val_acc_unmask,
+                        "val_acc_masked": val_acc_mask,
                     },
                 },
                 best_ckpt_path,
             )
-            logger.info(f"💾 Saved best model (acc={val_acc:.3f}) to: {best_ckpt_path}")
+            logger.info(f"💾 Saved best model (unmasked_acc={val_acc_unmask:.3f}, masked_acc={val_acc_mask:.3f}) to: {best_ckpt_path}")
         else:
             patience_counter += 1
             if patience_counter >= patience:
@@ -503,18 +522,20 @@ def train_supervised(
 
         if progress_cb:
             try:
-                progress_cb(ep, float(val_loss), float(val_acc))
+                progress_cb(ep, float(val_loss), float(val_acc_unmask))
             except Exception:
                 pass
 
-        # Log to both logger and console
+        # Log to both logger and console with unmasked and masked accuracy
         log_msg = (
             f"Epoch {ep}/{total_epochs}: "
-            f"train_loss={tr_loss:.4f} train_acc={tr_acc:.3f} | "
-            f"val_loss={val_loss:.4f} val_acc={val_acc:.3f} | "
+            f"train_loss={tr_loss:.4f} "
+            f"train_acc={tr_acc_unmask:.3f}→{tr_acc_mask:.3f} | "
+            f"val_loss={val_loss:.4f} "
+            f"val_acc={val_acc_unmask:.3f}→{val_acc_mask:.3f} | "
             f"lr={current_lr:.2e}"
         )
-        if val_acc == best_val_acc:
+        if val_acc_unmask == best_val_acc:
             log_msg += " 🌟"
         logger.info(log_msg)
         print(f"📊 {log_msg}", flush=True)
@@ -530,13 +551,19 @@ def train_supervised(
             "meta": {
                 "epochs": total_epochs,
                 "val_loss": history["val_loss"][-1] if history["val_loss"] else 0.0,
-                "val_acc": history["val_acc"][-1] if history["val_acc"] else 0.0,
+                "val_acc_unmasked": history["val_acc_unmasked"][-1] if history["val_acc_unmasked"] else 0.0,
+                "val_acc_masked": history["val_acc_masked"][-1] if history["val_acc_masked"] else 0.0,
             },
         },
         out_path,
     )
 
     logger.info("✅ Training complete!")
+    print(f"\n✅ Training complete!")
+    print(f"📊 Final metrics:")
+    print(f"   Unmasked accuracy: {history['val_acc_unmasked'][-1]:.3f} (true learning measure)")
+    print(f"   Masked accuracy: {history['val_acc_masked'][-1]:.3f} (with constraints)")
+    print(f"   Loss: {history['val_loss'][-1]:.4f}")
     return {"history": history}
 
 
