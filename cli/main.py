@@ -118,9 +118,10 @@ def cmd_ai_solve(args: argparse.Namespace) -> None:
 
         logger.debug(f"Step {step+1}: Got NN predictions (temp={temperature:.3f})")
 
-        # Apply mask to probabilities to ensure only legal moves are sampled
-        masked_probs = probs * mask_tensor
-        flat = masked_probs.view(-1)
+        # Explicitly zero out illegal moves to prevent numerical issues with multinomial
+        # Model masked them to -1e9, but after softmax they might be ~1e-billions, not exactly 0
+        probs = probs * mask_tensor
+        flat = probs.view(-1)
         total = float(flat.sum().item())
 
         if total <= 0.0:
@@ -315,7 +316,7 @@ def main() -> None:
     solve_parser.add_argument(
         "--temperature",
         type=float,
-        default=1.0,
+        default=0.3,
         help="Sampling temperature (lower = more deterministic)"
     )
     solve_parser.add_argument(
