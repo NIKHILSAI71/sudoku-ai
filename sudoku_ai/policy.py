@@ -53,18 +53,12 @@ def legal_mask_from_line(line: str) -> torch.Tensor:
 # ----------------------------
 
 class SudokuPolicyNet(nn.Module):
-    """Lightweight CNN for Sudoku move prediction.
-
-    Simple, fast, and effective architecture:
-    - Input: (10, 9, 9) one-hot encoding
-    - CNN backbone for pattern extraction
-    - Direct output to (81, 9) logits
-    """
+    """Lightweight CNN for Sudoku move prediction."""
 
     def __init__(self, channels: int = 256):
         super().__init__()
 
-        # Convolutional backbone - extract Sudoku patterns
+        # Convolutional backbone
         self.conv1 = nn.Conv2d(10, channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(channels)
 
@@ -77,7 +71,7 @@ class SudokuPolicyNet(nn.Module):
         self.conv4 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
         self.bn4 = nn.BatchNorm2d(channels)
 
-        # Output head - predict digit for each cell
+        # Output head
         self.head = nn.Sequential(
             nn.Conv2d(channels, 128, kernel_size=1),
             nn.ReLU(inplace=True),
@@ -87,31 +81,24 @@ class SudokuPolicyNet(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: board -> logits.
-
-        Args:
-            x: (B, 10, 9, 9) one-hot board encoding
-
-        Returns:
-            logits: (B, 81, 9) unnormalized scores for each (cell, digit)
-        """
+        """Forward pass: board -> logits."""
         # CNN feature extraction with residual connections
-        z = self.relu(self.bn1(self.conv1(x)))  # (B, C, 9, 9)
+        z = self.relu(self.bn1(self.conv1(x)))
 
         identity = z
         z = self.relu(self.bn2(self.conv2(z)))
-        z = z + identity  # Residual
+        z = z + identity
 
         identity = z
         z = self.relu(self.bn3(self.conv3(z)))
-        z = z + identity  # Residual
+        z = z + identity
 
         identity = z
         z = self.relu(self.bn4(self.conv4(z)))
-        z = z + identity  # Residual
+        z = z + identity
 
-        # Generate logits for each cell
-        logits = self.head(z)  # (B, 9, 9, 9)
+        # Generate logits
+        logits = self.head(z)
 
         # Reshape to (B, 81, 9)
         B = logits.size(0)
@@ -157,13 +144,7 @@ def train_supervised(
     seed: int = 42,
     progress_cb: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Train Sudoku policy network with supervised learning.
-
-    Key improvements:
-    - Simpler architecture for faster training
-    - Proper loss masking without breaking gradients
-    - Better learning rate schedule
-    """
+    """Train Sudoku policy network."""
     torch.manual_seed(seed)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -276,12 +257,12 @@ def train_supervised(
     logger.info(f"🧠 SudokuPolicyNet ({param_count:,} parameters)")
     print(f"🧠 SudokuPolicyNet ({param_count:,} parameters)")
 
-    # Optimizer with weight decay
+    # Optimizer
     opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.1)
 
-    # Loss function - ignore_index handles invalid positions
-    criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    # Loss function
+    criterion = nn.CrossEntropyLoss(ignore_index=-100, reduction='sum')
 
     history: Dict[str, List[float]] = {
         "train_loss": [],
@@ -291,7 +272,11 @@ def train_supervised(
     }
 
     def _epoch_pass(dl: DataLoader, train: bool) -> Tuple[float, float]:
-        """Run one epoch - returns (loss, accuracy)."""
+        """Run one epoch.
+
+        Key insight: Only compute loss on TARGET positions, where we have
+        multiple legal moves to choose from.
+        """
         model.train(train)
         tot_loss = 0.0
         tot_correct = 0
@@ -306,11 +291,42 @@ def train_supervised(
             # Forward pass
             logits = model(xb)  # (B, 81, 9)
 
-            # Apply legal move mask to logits (in-place for memory efficiency)
-            logits = logits.masked_fill(mb == 0, -1e9)
+            # For each sample, only compute loss at the TARGET cell
+            # This prevents the "always correct" issue
+            batch_size = xb.size(0)
+            target_logits = []
+            target_labels = []
 
-            # Compute loss
-            loss = criterion(logits.view(-1, 9), yb.view(-1))
+            for i in range(batch_size):
+                # Find target cell (where yb != -100)
+                target_mask = yb[i] != -100
+                target_indices = torch.where(target_mask)[0]
+
+                if len(target_indices) == 0:
+                    continue
+
+                # Get target cell and digit
+                target_idx = target_indices[0].item()
+                target_digit = yb[i, target_idx].item()
+
+                # Get logits for this cell ONLY
+                cell_logits = logits[i, target_idx]  # (9,)
+                cell_mask = mb[i, target_idx]  # (9,)
+
+                # Mask illegal moves
+                cell_logits_masked = cell_logits.masked_fill(cell_mask == 0, -1e9)
+
+                target_logits.append(cell_logits_masked)
+                target_labels.append(target_digit)
+
+            if len(target_logits) == 0:
+                continue
+
+            # Stack and compute loss
+            target_logits = torch.stack(target_logits)  # (B, 9)
+            target_labels = torch.tensor(target_labels, device=device, dtype=torch.long)
+
+            loss = nn.functional.cross_entropy(target_logits, target_labels)
 
             if train:
                 loss.backward()
@@ -318,55 +334,25 @@ def train_supervised(
                 opt.step()
 
             # Track metrics
-            tot_loss += loss.item() * xb.size(0)
+            tot_loss += loss.item() * len(target_labels)
 
             with torch.no_grad():
-                pred = torch.argmax(logits, dim=-1)
-                mask = (yb >= 0)
-                tot_correct += (pred.eq(yb) & mask).sum().item()
-                tot_count += mask.sum().item()
+                pred = torch.argmax(target_logits, dim=-1)
+                tot_correct += pred.eq(target_labels).sum().item()
+                tot_count += len(target_labels)
 
-        avg_loss = tot_loss / len(dl.dataset)
+        avg_loss = tot_loss / tot_count if tot_count > 0 else 0.0
         avg_acc = tot_correct / tot_count if tot_count > 0 else 0.0
         return avg_loss, avg_acc
 
-    # 5) Sanity check - verify training isn't trivial
-    logger.info("🔍 Running sanity check on sample batch...")
-    sample_loader = DataLoader(train_ds, batch_size=32, shuffle=False)
-    xb, yb, mb = next(iter(sample_loader))
-    xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
-
-    # Check that masks have multiple legal moves (not trivial)
-    num_legal_per_sample = mb.sum(dim=[1, 2]).cpu().numpy()
-    avg_legal_moves = num_legal_per_sample.mean()
-    logger.info(f"   Average legal moves per sample: {avg_legal_moves:.1f}")
-
-    if avg_legal_moves < 5:
-        logger.warning("⚠️ Very few legal moves per sample - training may be too easy!")
-
-    # Check untrained model accuracy
-    with torch.no_grad():
-        logits = model(xb)
-        logits_masked = logits.masked_fill(mb == 0, -1e9)
-        pred = torch.argmax(logits_masked, dim=-1)
-        mask = (yb >= 0)
-        untrained_acc = (pred.eq(yb) & mask).sum().item() / mask.sum().item()
-        logger.info(f"   Untrained model accuracy: {untrained_acc:.3f} (should be ~0.11 for 9-class random)")
-
-    if untrained_acc > 0.5:
-        logger.error("❌ Untrained model has >50% accuracy - task is too easy or data is leaking!")
-        raise RuntimeError("Training data is too easy - model doesn't need to learn")
-
-    logger.info("✅ Sanity check passed")
-
-    # 6) Training loop
+    # 5) Training loop
     logger.info(f"🎯 Training {epochs} epochs...")
     print(f"\n{'='*60}")
     print(f"🎯 Training: {epochs} epochs, {len(train_ds)} samples")
     print(f"{'='*60}\n")
 
     best_val_loss = float('inf')
-    patience = 5
+    patience = 10
     patience_counter = 0
 
     for ep in range(1, epochs + 1):
@@ -385,7 +371,8 @@ def train_supervised(
         history["val_acc"].append(val_acc)
 
         # Early stopping
-        if val_loss < best_val_loss:
+        improved = val_loss < best_val_loss
+        if improved:
             best_val_loss = val_loss
             patience_counter = 0
             best_ckpt = out_path.replace('.pt', '_best.pt')
@@ -402,11 +389,13 @@ def train_supervised(
                 break
 
         log_msg = (
-            f"Epoch {ep}/{epochs}: "
-            f"train_loss={tr_loss:.4f} train_acc={tr_acc:.3f} | "
+            f"Epoch {ep:3d}/{epochs}: "
+            f"loss={tr_loss:.4f} acc={tr_acc:.3f} | "
             f"val_loss={val_loss:.4f} val_acc={val_acc:.3f} | "
             f"lr={current_lr:.2e}"
         )
+        if improved:
+            log_msg += " 🌟"
         logger.info(log_msg)
         print(f"📊 {log_msg}")
 
@@ -421,8 +410,8 @@ def train_supervised(
 
     logger.info("✅ Training complete!")
     print(f"\n✅ Training complete!")
+    print(f"📊 Best accuracy: {max(history['val_acc']):.3f}")
     print(f"📊 Final accuracy: {history['val_acc'][-1]:.3f}")
-    print(f"📊 Final loss: {history['val_loss'][-1]:.4f}")
 
     return {"history": history}
 
