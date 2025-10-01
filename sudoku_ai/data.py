@@ -108,38 +108,91 @@ def read_puzzles(paths: Iterable[str]) -> List[str]:
 def make_partial_samples(puzzle: str, solution: str, steps: int = 40) -> List[Tuple[str, np.ndarray]]:
     """
     Create a sequence of (partial_board_line, targets) pairs from a full solution.
-    Each sample teaches the model to predict one next move.
+    Uses intelligent ordering to teach logical solving strategies:
+    1. Naked singles (cells with only one candidate)
+    2. Hidden singles (digits with only one position in row/col/box)
+    3. Random logical moves
+
     - targets is an (81,) int array with -100 everywhere except for the one cell to be filled,
       which has the target digit (0..8).
     """
     g_puz = parse_line(puzzle)
     g_sol = parse_line(solution)
 
-    # Get indices of non-given cells, in a random order
-    sol_indices = [i for i, p_val in enumerate(g_puz.flatten()) if p_val == 0]
-    random.shuffle(sol_indices)
-
     samples: List[Tuple[str, np.ndarray]] = []
     cur = g_puz.copy()
 
-    # Create up to `steps` samples, each teaching one move
-    num_to_fill = min(steps, len(sol_indices))
-    for i in range(num_to_fill):
-        # The current board is the input
-        current_line = _line_from_grid(cur)
+    # Create samples by filling cells strategically
+    filled_count = 0
+    max_attempts = steps * 3  # Prevent infinite loops
 
-        # The target is the next cell to fill
-        idx_to_fill = sol_indices[i]
-        sol_digit = g_sol.flatten()[idx_to_fill]
+    for attempt in range(max_attempts):
+        if filled_count >= steps:
+            break
+
+        # Find logical moves using candidate analysis
+        b = Board(cur)
+        candidates_mask = b.candidates_mask()
+
+        # Priority 1: Naked singles (cells with only one candidate)
+        naked_singles = []
+        for r in range(9):
+            for c in range(9):
+                if cur[r, c] == 0:
+                    mask = int(candidates_mask[r, c])
+                    if mask > 0:
+                        num_candidates = bin(mask).count('1')
+                        if num_candidates == 1:
+                            # Find the single candidate
+                            for d in range(1, 10):
+                                if mask & (1 << (d - 1)):
+                                    naked_singles.append((r, c, d))
+                                    break
+
+        # Priority 2: Hidden singles (digit has only one position in row/col/box)
+        hidden_singles = []
+        if not naked_singles:
+            for r in range(9):
+                for d in range(1, 10):
+                    positions = []
+                    for c in range(9):
+                        if cur[r, c] == 0:
+                            mask = int(candidates_mask[r, c])
+                            if mask & (1 << (d - 1)):
+                                positions.append((r, c))
+                    if len(positions) == 1:
+                        hidden_singles.append((positions[0][0], positions[0][1], d))
+
+        # Choose move: prefer logical moves
+        move_to_make = None
+        if naked_singles:
+            move_to_make = random.choice(naked_singles)
+        elif hidden_singles:
+            move_to_make = random.choice(hidden_singles)
+        else:
+            # Fallback: pick any valid move from solution
+            empty_cells = [(r, c) for r in range(9) for c in range(9) if cur[r, c] == 0]
+            if empty_cells:
+                r, c = random.choice(empty_cells)
+                move_to_make = (r, c, g_sol[r, c])
+
+        if move_to_make is None:
+            break  # No more moves possible
+
+        r, c, digit = move_to_make
+
+        # Create training sample
+        current_line = _line_from_grid(cur)
+        idx_to_fill = r * 9 + c
 
         targets = np.full((81,), -100, dtype=np.int64)
-        targets[idx_to_fill] = sol_digit - 1
+        targets[idx_to_fill] = digit - 1
 
         samples.append((current_line, targets))
 
-        # Update the board for the next iteration
-        r, c = divmod(idx_to_fill, 9)
-        cur[r, c] = sol_digit
+        # Apply the move
+        cur[r, c] = digit
+        filled_count += 1
 
     return samples
 
@@ -170,8 +223,22 @@ def build_supervised_records(
     if len(puzzles) != len(solutions):
         raise ValueError(f"Puzzles ({len(puzzles)}) and solutions ({len(solutions)}) must have same length")
 
+    # Limit puzzles processed if max_samples specified
+    puzzles_to_process = puzzles
+    solutions_to_process = solutions
+
+    if max_samples is not None:
+        # Each puzzle generates ~40 samples, so we only need max_samples/40 puzzles
+        max_puzzles = (max_samples // 40) + 1
+        if len(puzzles) > max_puzzles:
+            print(f"   💡 Limiting to {max_puzzles:,} puzzles (enough for {max_samples:,} samples)")
+            puzzles_to_process = puzzles[:max_puzzles]
+            solutions_to_process = solutions[:max_puzzles]
+
     recs: List[SupervisedRecord] = []
-    for pz, sol in zip(puzzles, solutions):
+    total = len(puzzles_to_process)
+
+    for idx, (pz, sol) in enumerate(zip(puzzles_to_process, solutions_to_process)):
         # Validate solution is complete
         if len(sol) != 81 or '0' in sol:
             continue  # Skip incomplete solutions
@@ -182,7 +249,12 @@ def build_supervised_records(
         for line, tgt in make_partial_samples(pz, sol, steps=40):
             recs.append(SupervisedRecord(line, tgt))
             if max_samples is not None and len(recs) >= max_samples:
+                print(f"   ✅ Reached {len(recs):,} samples (target: {max_samples:,})")
                 return recs
+
+        # Progress update every 1000 puzzles or at specific percentages
+        if (idx + 1) % 1000 == 0 or (idx + 1) in [int(total * p) for p in [0.25, 0.5, 0.75]]:
+            print(f"   📊 Progress: {idx+1:,}/{total:,} puzzles → {len(recs):,} samples", flush=True)
 
     return recs
 
