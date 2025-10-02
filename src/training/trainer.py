@@ -215,22 +215,24 @@ class GNNTrainer:
             
             total_loss += loss_info['total_loss']
             
-            # Compute accuracy
+            # VECTORIZED ACCURACY COMPUTATION (No Python loops!)
             mask = (puzzles == 0)
             preds = logits.argmax(dim=-1) + 1  # Convert 0-indexed to 1-indexed
             
-            for i in range(len(puzzles)):
-                if mask[i].any():
-                    correct = (preds[i][mask[i]] == solutions[i][mask[i]]).sum().item()
-                    total = mask[i].sum().item()
-                    correct_cells += correct
-                    total_cells += total
-                    
-                    # Grid accuracy (all cells correct)
-                    if correct == total:
-                        correct_grids += 1
-                
-                total_grids += 1
+            # Vectorized cell accuracy
+            correct_mask = (preds == solutions) & mask  # [B, H, W]
+            correct_cells += correct_mask.sum().item()
+            total_cells += mask.sum().item()
+            
+            # Vectorized grid accuracy
+            # For each grid, count correct cells and compare to total cells
+            correct_per_grid = correct_mask.view(len(puzzles), -1).sum(dim=1)  # [B]
+            total_per_grid = mask.view(len(puzzles), -1).sum(dim=1)  # [B]
+            
+            # Grid is fully correct if all empty cells are correct
+            fully_correct = (correct_per_grid == total_per_grid) & (total_per_grid > 0)
+            correct_grids += fully_correct.sum().item()
+            total_grids += len(puzzles)
         
         # Average metrics
         metrics = {

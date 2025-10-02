@@ -187,24 +187,26 @@ class SudokuLoss(nn.Module):
         box_target = torch.ones_like(box_sums)
         box_loss = F.mse_loss(box_sums, box_target)
         
-        # === ENTROPY REGULARIZATION ===
+        # === ENTROPY REGULARIZATION (Optimized) ===
         # Encourage confident predictions (low entropy)
-        # This helps the model commit to specific digits
-        entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)
+        # Use log_softmax for numerical stability and efficiency
+        log_probs = F.log_softmax(logits, dim=-1)
+        entropy = -(probs * log_probs).sum(dim=-1)  # More stable than log(probs)
         entropy_masked = (entropy * mask).sum() / (mask.sum() + 1e-8)
         entropy_loss = 0.1 * entropy_masked
         
-        # === UNIQUENESS CONSTRAINT ===
+        # === UNIQUENESS CONSTRAINT (Optimized) ===
         # Penalize having multiple high-probability predictions in same constraint
-        # Get top-2 probabilities for each cell
+        # Get top-2 probabilities for each cell (topk is already optimized)
         top_probs, _ = probs.topk(2, dim=-1)
         confidence_gap = top_probs[..., 0] - top_probs[..., 1]  # Should be large
-        uniqueness_loss = 0.1 * (1.0 - confidence_gap).clamp(min=0).mean()
+        # Fused clamp and mean operation
+        uniqueness_loss = 0.1 * F.relu(1.0 - confidence_gap).mean()
         
-        # Combine all constraint losses
+        # Combine all constraint losses (pre-scaled for efficiency)
         total_constraint_loss = (
             row_loss + col_loss + box_loss + 
             entropy_loss + uniqueness_loss
-        ) / 5.0
+        ) * 0.2  # Multiply by 1/5 = 0.2
         
         return total_constraint_loss
