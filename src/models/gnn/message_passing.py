@@ -144,7 +144,7 @@ class MessagePassingLayer(nn.Module):
         edge_index: torch.Tensor,
         batch_size: int
     ) -> torch.Tensor:
-        """Compute messages for all edges.
+        """VECTORIZED message computation - no Python loops!
         
         Args:
             node_features: (batch_size * num_nodes, hidden_dim) flat features
@@ -155,28 +155,29 @@ class MessagePassingLayer(nn.Module):
             messages: (batch_size * num_edges, hidden_dim) messages
         """
         num_edges = edge_index.size(1)
+        num_nodes = node_features.size(0) // batch_size
         
-        # Get source and target node features for each edge
-        # For batched processing, we need to offset node indices
-        messages_list = []
+        # Create batched edge indices in one operation (vectorized!)
+        # Shape: (batch_size, num_edges)
+        batch_offsets = torch.arange(batch_size, device=edge_index.device) * num_nodes
+        batch_offsets = batch_offsets.view(-1, 1)  # (batch_size, 1)
         
-        for b in range(batch_size):
-            offset = b * (node_features.size(0) // batch_size)
-            source_idx = edge_index[0] + offset
-            target_idx = edge_index[1] + offset
-            
-            source_features = node_features[source_idx]
-            target_features = node_features[target_idx]
-            
-            # Concatenate source and target features
-            combined = torch.cat([source_features, target_features], dim=-1)
-            
-            # Compute message
-            batch_messages = self.message_net(combined)
-            messages_list.append(batch_messages)
+        # Expand edge indices for all batches simultaneously
+        # (2, num_edges) + (batch_size, 1) -> (batch_size, 2, num_edges)
+        source_idx = edge_index[0].unsqueeze(0) + batch_offsets  # (batch_size, num_edges)
+        target_idx = edge_index[1].unsqueeze(0) + batch_offsets  # (batch_size, num_edges)
         
-        # Stack messages from all batches
-        messages = torch.cat(messages_list, dim=0)
+        # Flatten to get all indices at once
+        source_idx_flat = source_idx.reshape(-1)  # (batch_size * num_edges)
+        target_idx_flat = target_idx.reshape(-1)  # (batch_size * num_edges)
+        
+        # Gather all source and target features in parallel (fully vectorized!)
+        source_features = node_features[source_idx_flat]  # (batch_size * num_edges, hidden_dim)
+        target_features = node_features[target_idx_flat]  # (batch_size * num_edges, hidden_dim)
+        
+        # Concatenate and compute messages for ALL edges at once
+        combined = torch.cat([source_features, target_features], dim=-1)
+        messages = self.message_net(combined)  # Single forward pass for entire batch!
         
         return messages
     
@@ -187,7 +188,7 @@ class MessagePassingLayer(nn.Module):
         num_nodes: int,
         batch_size: int
     ) -> torch.Tensor:
-        """Aggregate messages at each node.
+        """VECTORIZED message aggregation - no Python loops!
         
         Args:
             messages: (batch_size * num_edges, hidden_dim) messages
@@ -201,9 +202,17 @@ class MessagePassingLayer(nn.Module):
         num_edges = edge_index.size(1)
         hidden_dim = messages.size(-1)
         device = messages.device
-        dtype = messages.dtype  # Match dtype for mixed precision compatibility
+        dtype = messages.dtype
         
-        # Initialize aggregation buffer with same dtype as messages
+        # Create batched target indices (vectorized!)
+        batch_offsets = torch.arange(batch_size, device=device) * num_nodes
+        batch_offsets = batch_offsets.view(-1, 1)  # (batch_size, 1)
+        
+        # Expand target indices for all batches
+        target_idx = edge_index[1].unsqueeze(0) + batch_offsets  # (batch_size, num_edges)
+        target_idx_flat = target_idx.reshape(-1)  # (batch_size * num_edges)
+        
+        # Initialize aggregation buffer
         aggregated = torch.zeros(
             batch_size * num_nodes,
             hidden_dim,
@@ -218,17 +227,13 @@ class MessagePassingLayer(nn.Module):
             dtype=dtype
         )
         
-        # Aggregate messages
-        for b in range(batch_size):
-            offset = b * num_nodes
-            msg_offset = b * num_edges
-            
-            target_idx = edge_index[1] + offset
-            batch_messages = messages[msg_offset:msg_offset + num_edges]
-            
-            # Use scatter_add for efficient aggregation
-            aggregated.index_add_(0, target_idx, batch_messages)
-            counts.index_add_(0, target_idx, torch.ones(num_edges, device=device, dtype=dtype))
+        # Aggregate ALL messages at once using scatter_add (fully vectorized!)
+        aggregated.index_add_(0, target_idx_flat, messages)
+        counts.index_add_(
+            0, 
+            target_idx_flat, 
+            torch.ones(batch_size * num_edges, device=device, dtype=dtype)
+        )
         
         # Average aggregation (avoid division by zero)
         counts = counts.clamp(min=1).unsqueeze(-1)
