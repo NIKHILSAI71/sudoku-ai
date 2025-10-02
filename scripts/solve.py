@@ -15,8 +15,7 @@ import torch
 import numpy as np
 
 from src.utils.logger import setup_logging
-from src.models.gnn.sudoku_gnn import load_pretrained_model
-from src.inference.hybrid_solver import HybridSolver
+from src.inference.neural_solver import load_neural_solver
 from src.core.parser import parse_line
 from src.core.board import Board
 from src.core.validator import is_valid_board
@@ -68,27 +67,21 @@ def main():
     parser.add_argument(
         "--strategy",
         type=str,
-        default="auto",
-        choices=["auto", "iterative", "beam", "backtrack"],
-        help="Solving strategy"
+        default="iterative",
+        choices=["greedy", "iterative", "careful"],
+        help="Solving strategy: greedy (fast), iterative (balanced), careful (accurate)"
     )
     parser.add_argument(
         "--confidence",
         type=float,
-        default=0.95,
-        help="Confidence threshold for iterative solving"
+        default=0.90,
+        help="Initial confidence threshold for iterative solving"
     )
     parser.add_argument(
         "--max-iterations",
         type=int,
         default=50,
         help="Max iterations for iterative solving"
-    )
-    parser.add_argument(
-        "--beam-width",
-        type=int,
-        default=5,
-        help="Beam width for beam search"
     )
     
     # Display
@@ -135,49 +128,50 @@ def main():
     if not args.no_pretty:
         print_board(puzzle_grid, "Input Puzzle:")
     
-    # Load model
-    logger.info(f"Loading model from: {args.checkpoint}")
+    # Load neural solver
+    logger.info(f"Loading neural solver from: {args.checkpoint}")
     checkpoint_path = Path(args.checkpoint)
     
     if not checkpoint_path.exists():
         logger.error(f"Checkpoint not found: {args.checkpoint}")
-        logger.error("Train a model first with: python scripts/train.py --dataset <path>")
+        logger.error("Train a model first with: python scripts/train.py --data <path>")
         raise SystemExit(1)
     
-    model = load_pretrained_model(
+    solver = load_neural_solver(
         checkpoint_path=str(checkpoint_path),
-        device=args.device
-    )
-    logger.info(f"Model loaded successfully on {args.device}")
-    
-    # Create solver
-    solver = HybridSolver(
-        model=model,
         device=args.device,
-        confidence_threshold=args.confidence,
-        max_iterations=args.max_iterations,
-        beam_width=args.beam_width
+        verbose=args.verbose
     )
+    logger.info(f"🧠 Neural solver loaded successfully on {args.device}")
     
     # Solve
-    print(f"\nSolving with strategy: {args.strategy}")
-    print(f"Confidence threshold: {args.confidence}")
+    print("\n" + "=" * 70)
+    print("  🧠 PURE NEURAL SOLVING (No Classical Algorithms)")
+    print("=" * 70)
+    print(f"\nStrategy: {args.strategy}")
+    print(f"Initial confidence: {args.confidence}")
+    print(f"Max iterations: {args.max_iterations}\n")
     
-    start_time = time.time()
-    solution, info = solver.solve(puzzle_tensor, strategy=args.strategy)
-    solve_time = time.time() - start_time
+    solution, info = solver.solve(
+        puzzle_tensor,
+        strategy=args.strategy,
+        max_iterations=args.max_iterations,
+        initial_confidence=args.confidence
+    )
     
     # Display results
     print("\n" + "=" * 70)
     if info['success']:
-        print("  ✅ PUZZLE SOLVED!")
+        print("  ✅ SOLVED BY NEURAL NETWORK!")
     else:
-        print("  ⚠️ SOLVING FAILED")
+        print("  ⚠️ INCOMPLETE SOLUTION")
     print("=" * 70)
     
-    print(f"\nStrategy used: {info['strategy']}")
-    print(f"Solve time: {solve_time*1000:.2f} ms")
-    print(f"Iterations: {info.get('iterations', 'N/A')}")
+    print(f"\nMethod: {info.get('method', 'unknown')}")
+    print(f"Solve time: {info['solve_time_ms']:.2f} ms")
+    print(f"Iterations: {info.get('iterations', 1)}")
+    print(f"Cells filled: {info.get('cells_filled', 0)}")
+    print(f"Avg confidence: {info.get('avg_confidence', 0.0):.3f}")
     
     if not args.no_pretty:
         solution_np = solution.cpu().numpy()
