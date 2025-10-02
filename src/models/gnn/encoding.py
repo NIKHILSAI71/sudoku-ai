@@ -59,28 +59,27 @@ class SudokuEncoder:
         # Feature 2: Is given mask
         is_given = (values > 0).float().unsqueeze(-1)
         
-        # Features 3-5: Relative positions
-        positions = []
-        for row in range(grid_size):
-            for col in range(grid_size):
-                # Relative row and column [0, 1]
-                rel_row = row / grid_size
-                rel_col = col / grid_size
-                
-                # Relative block position [0, 1]
-                block_row = row // block_size
-                block_col = col // block_size
-                block_idx = block_row * block_size + block_col
-                rel_block = block_idx / (block_size * block_size)
-                
-                positions.append([rel_row, rel_col, rel_block])
+        # Features 3-5: Relative positions (VECTORIZED - no Python loops!)
+        # Create row and column indices: (grid_size, grid_size)
+        rows = torch.arange(grid_size, device=device).float()
+        cols = torch.arange(grid_size, device=device).float()
         
-        # Create position tensor: (n_cells, 3)
-        pos_tensor = torch.tensor(
-            positions, 
-            dtype=torch.float32, 
-            device=device
-        )
+        # Create meshgrid for all positions at once
+        row_idx, col_idx = torch.meshgrid(rows, cols, indexing='ij')
+        
+        # Relative row and column [0, 1]: (grid_size, grid_size)
+        rel_row = row_idx / grid_size
+        rel_col = col_idx / grid_size
+        
+        # Relative block position [0, 1]: (grid_size, grid_size)
+        block_row = (row_idx / block_size).long()
+        block_col = (col_idx / block_size).long()
+        block_idx = block_row * block_size + block_col
+        rel_block = block_idx.float() / (block_size * block_size)
+        
+        # Stack and reshape: (grid_size, grid_size, 3) -> (n_cells, 3)
+        pos_tensor = torch.stack([rel_row, rel_col, rel_block], dim=-1)
+        pos_tensor = pos_tensor.reshape(n_cells, 3)
         
         # Expand for batch: (batch_size, n_cells, 3)
         pos_features = pos_tensor.unsqueeze(0).expand(batch_size, -1, -1)
