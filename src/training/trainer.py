@@ -134,7 +134,7 @@ class GNNTrainer:
             # Compute accuracy
             mask = (puzzles == 0)
             if mask.any():
-                preds = logits.argmax(dim=-1)
+                preds = logits.argmax(dim=-1) + 1  # Convert 0-indexed to 1-indexed
                 correct = (preds[mask] == solutions[mask]).sum().item()
                 total = mask.sum().item()
                 correct_cells += correct
