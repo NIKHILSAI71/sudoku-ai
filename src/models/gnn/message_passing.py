@@ -174,18 +174,21 @@ class MessagePassingLayer(nn.Module):
         num_edges = edge_index.size(1)
         hidden_dim = messages.size(-1)
         device = messages.device
+        dtype = messages.dtype  # Match dtype for mixed precision compatibility
         
-        # Initialize aggregation buffer
+        # Initialize aggregation buffer with same dtype as messages
         aggregated = torch.zeros(
             batch_size * num_nodes,
             hidden_dim,
-            device=device
+            device=device,
+            dtype=dtype
         )
         
         # Count incoming messages for averaging
         counts = torch.zeros(
             batch_size * num_nodes,
-            device=device
+            device=device,
+            dtype=dtype
         )
         
         # Aggregate messages
@@ -198,7 +201,7 @@ class MessagePassingLayer(nn.Module):
             
             # Use scatter_add for efficient aggregation
             aggregated.index_add_(0, target_idx, batch_messages)
-            counts.index_add_(0, target_idx, torch.ones(num_edges, device=device))
+            counts.index_add_(0, target_idx, torch.ones(num_edges, device=device, dtype=dtype))
         
         # Average aggregation (avoid division by zero)
         counts = counts.clamp(min=1).unsqueeze(-1)
