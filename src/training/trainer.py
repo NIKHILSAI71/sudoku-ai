@@ -18,7 +18,8 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp.autocast_mode import autocast
+from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 
 from ..models.gnn.sudoku_gnn import SudokuGNN
@@ -111,7 +112,7 @@ class GNNTrainer:
             
             # Forward pass with mixed precision
             if self.use_amp and self.scaler is not None:
-                with autocast():
+                with autocast(device_type='cuda', dtype=torch.float16):
                     logits = self.model(puzzles)
                     loss, loss_info = self.criterion(logits, solutions, puzzles)
                 
@@ -183,7 +184,7 @@ class GNNTrainer:
             
             # Forward pass
             if self.use_amp:
-                with autocast():
+                with autocast(device_type='cuda', dtype=torch.float16):
                     logits = self.model(puzzles)
                     loss, loss_info = self.criterion(logits, solutions, puzzles)
             else:
