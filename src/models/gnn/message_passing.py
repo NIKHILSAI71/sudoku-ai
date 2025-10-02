@@ -17,50 +17,67 @@ import torch.nn.functional as F
 
 
 class MessagePassingLayer(nn.Module):
-    """Single message passing layer for Sudoku constraint propagation.
+    """Enhanced message passing layer with residual connections and GELU.
     
     This layer implements one iteration of:
     1. Message computation: Compute messages from neighbors
     2. Message aggregation: Sum/mean messages at each node
     3. Node update: Update node embeddings with aggregated messages
+    4. Residual connection: Add skip connection for better gradient flow
     
     The architecture is size-agnostic - works for any graph structure.
+    Improvements over basic version:
+    - GELU activation (better than ReLU for pattern learning)
+    - Stronger residual connections
+    - Pre-layer normalization
+    - Gated updates for selective information flow
     """
     
     def __init__(
         self,
         hidden_dim: int = 96,
         dropout: float = 0.3,
-        activation: str = 'relu'
+        activation: str = 'gelu',
+        use_gates: bool = True
     ):
-        """Initialize message passing layer.
+        """Initialize enhanced message passing layer.
         
         Args:
             hidden_dim: Dimension of node embeddings
             dropout: Dropout probability for regularization
-            activation: Activation function ('relu', 'gelu', 'elu')
+            activation: Activation function ('gelu', 'silu', 'relu', 'elu')
+            use_gates: Use gated updates for selective information flow
         """
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.use_gates = use_gates
+        
+        # Pre-layer normalization for better training dynamics
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
         
         # Message computation: combine source and target features
         self.message_net = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.Linear(2 * hidden_dim, hidden_dim * 2),
             self._get_activation(activation),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(hidden_dim * 2, hidden_dim)
         )
         
         # Node update: combine current state with aggregated messages
         self.update_net = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.Linear(2 * hidden_dim, hidden_dim * 2),
             self._get_activation(activation),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(hidden_dim * 2, hidden_dim)
         )
         
-        # Layer normalization for training stability
-        self.layer_norm = nn.LayerNorm(hidden_dim)
+        # Gated update mechanism (like GRU)
+        if use_gates:
+            self.gate_net = nn.Sequential(
+                nn.Linear(2 * hidden_dim, hidden_dim),
+                nn.Sigmoid()
+            )
     
     def _get_activation(self, name: str) -> nn.Module:
         """Get activation function by name."""
@@ -102,12 +119,22 @@ class MessagePassingLayer(nn.Module):
         # Reshape back to batch format
         aggregated = aggregated.view(batch_size, num_nodes, hidden_dim)
         
+        # Pre-normalization
+        normed_features = self.norm1(node_features)
+        
         # Update node features
-        combined = torch.cat([node_features, aggregated], dim=-1)
+        combined = torch.cat([normed_features, aggregated], dim=-1)
         updated = self.update_net(combined)
         
-        # Residual connection + layer norm
-        output = self.layer_norm(node_features + updated)
+        # Gated residual connection if enabled
+        if self.use_gates:
+            gate = self.gate_net(combined)
+            output = node_features + gate * updated
+        else:
+            output = node_features + updated
+        
+        # Post-normalization
+        output = self.norm2(output)
         
         return output
     
@@ -211,10 +238,15 @@ class MessagePassingLayer(nn.Module):
 
 
 class RecurrentMessagePassing(nn.Module):
-    """Recurrent message passing with shared parameters.
+    """Enhanced recurrent message passing with shared parameters and gating.
     
     Performs multiple iterations of message passing using the same layer.
     This is memory-efficient and enables deep reasoning without parameter explosion.
+    
+    Improvements:
+    - GELU activation for better pattern learning
+    - Gated updates for selective information flow
+    - Better gradient flow through residual connections
     
     Research shows 32 iterations is optimal for Sudoku.
     """
@@ -224,21 +256,26 @@ class RecurrentMessagePassing(nn.Module):
         hidden_dim: int = 96,
         num_iterations: int = 32,
         dropout: float = 0.3,
-        activation: str = 'relu'
+        activation: str = 'gelu'
     ):
-        """Initialize recurrent message passing.
+        """Initialize enhanced recurrent message passing.
         
         Args:
             hidden_dim: Dimension of node embeddings
             num_iterations: Number of message passing iterations
             dropout: Dropout probability
-            activation: Activation function
+            activation: Activation function (default 'gelu')
         """
         super().__init__()
         self.num_iterations = num_iterations
         
-        # Single shared layer used recurrently
-        self.mp_layer = MessagePassingLayer(hidden_dim, dropout, activation)
+        # Single shared layer used recurrently with enhanced features
+        self.mp_layer = MessagePassingLayer(
+            hidden_dim, 
+            dropout, 
+            activation,
+            use_gates=True  # Enable gated updates
+        )
     
     def forward(
         self,
