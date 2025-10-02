@@ -1,5 +1,5 @@
 """Inference strategies for Sudoku solving."""
 
-from .hybrid_solver import HybridSolver
+from .neural_solver import NeuralSolver, load_neural_solver
 
-__all__ = ['HybridSolver']
+__all__ = ['NeuralSolver', 'load_neural_solver']
