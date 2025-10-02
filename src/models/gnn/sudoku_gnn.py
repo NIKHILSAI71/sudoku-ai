@@ -73,13 +73,14 @@ class SudokuGNN(nn.Module):
         # Input feature dimension
         self.input_dim = 5 + (grid_size if use_candidates else 0)
         
-        # Input encoder: Project features to hidden dimension
+        # Input encoder: Project features to hidden dimension with GELU
         self.encoder = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.Linear(self.input_dim, hidden_dim * 2),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim)
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout * 0.5)  # Additional light dropout
         )
         
         # Message passing module
@@ -96,11 +97,15 @@ class SudokuGNN(nn.Module):
                 dropout=dropout
             )
         
-        # Output decoder: Predict digit probabilities
+        # Output decoder: Predict digit probabilities with better architecture
         self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.GELU(),
             nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
             nn.Linear(hidden_dim, grid_size)  # Logits for each digit
         )
         
