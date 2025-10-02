@@ -168,7 +168,7 @@ model = SudokuGNNPolicy(
 ```python
 # Single-pass only, 85-93% accuracy
 logits = model(puzzle_tensor)
-predictions = logits.argmax(dim=-1)
+predictions = logits.argmax(dim=-1) + 1  # Convert to 1-indexed digits
 # No refinement, no guarantees
 ```
 
@@ -355,7 +355,7 @@ model = SudokuGNNPolicy(grid_size=9)
 ```python
 # Old
 logits = model(puzzle)
-predictions = logits.argmax(dim=-1)
+predictions = logits.argmax(dim=-1) + 1  # Convert to 1-indexed digits
 
 # New (100% accuracy)
 from sudoku_ai.inference import hybrid_solve
