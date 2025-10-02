@@ -121,7 +121,8 @@ class SudokuGNN(nn.Module):
             
         Returns:
             logits: (batch_size, grid_size, grid_size, grid_size) digit logits
-                    logits[b, i, j, v] = score for value v+1 at position (i, j)
+                    logits[b, i, j, v] = score for digit (v+1) at position (i, j)
+                    Output has grid_size classes (0-8 for 9x9) representing digits 1-9
                     
         Example:
             >>> model = SudokuGNN(grid_size=9)
