@@ -1,0 +1,32 @@
+# Model Configuration
+model:
+  type: "gnn"  # gnn, lightweight_gnn, hybrid_gnn
+  grid_size: 9
+  hidden_dim: 96
+  num_iterations: 32
+  dropout: 0.3
+  use_attention: false
+  use_candidates: false
+
+# Architecture variants
+variants:
+  standard:
+    hidden_dim: 96
+    num_iterations: 32
+    dropout: 0.3
+  
+  lightweight:
+    hidden_dim: 64
+    num_iterations: 16
+    dropout: 0.2
+  
+  large:
+    hidden_dim: 128
+    num_iterations: 48
+    dropout: 0.4
+
+# Size generalization
+multi_size:
+  enabled: false
+  sizes: [4, 6, 9, 12, 16]
+  weights: [0.1, 0.15, 0.5, 0.15, 0.1]  # Sampling probability

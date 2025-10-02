@@ -1,0 +1,43 @@
+# Inference Configuration
+inference:
+  # Device settings
+  device: "cuda"  # cuda, cpu, mps
+  batch_size: 32
+  
+  # Strategy
+  strategy: "hybrid"  # iterative, beam_search, backtracking, hybrid
+  
+  # Iterative refinement
+  iterative:
+    max_iterations: 10
+    confidence_threshold: 0.95
+    temperature: 1.0
+  
+  # Beam search
+  beam_search:
+    beam_width: 5
+    max_steps: 50
+  
+  # Hybrid solver
+  hybrid:
+    neural_first: true
+    fallback_to_backtracking: true
+    max_neural_time_ms: 200
+  
+  # Output format
+  output:
+    include_confidence: true
+    include_timing: true
+    return_probabilities: false
+  
+# Performance optimization
+optimization:
+  use_mixed_precision: true
+  compile_model: false  # PyTorch 2.0+ compilation
+  use_cuda_graphs: false
+  
+# Batch processing
+batch:
+  dynamic_batching: true
+  max_batch_size: 128
+  timeout_ms: 5000

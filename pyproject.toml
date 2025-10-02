@@ -4,24 +4,99 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sudoku-ai"
-version = "1.0.0"
-description = "Production-grade AI-powered Sudoku solver using neural networks"
+version = "2.0.0"
+description = "Production-grade size-agnostic GNN-based Sudoku solver"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Sudoku AI Team" }]
 license = { text = "MIT" }
+keywords = ["sudoku", "ai", "gnn", "graph-neural-network", "deep-learning", "constraint-satisfaction"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
 dependencies = [
   "numpy>=1.26",
-  "rich>=13.7",
   "torch>=2.0",
+  "torch-geometric>=2.4.0",
+  "torch-scatter>=2.1.0",
+  "torch-sparse>=0.6.0",
+  "pyyaml>=6.0",
+  "omegaconf>=2.3.0",
+  "rich>=13.7",
+  "tqdm>=4.66",
 ]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.3.0",
+  "black>=23.0.0",
+  "ruff>=0.0.270",
+  "mypy>=1.0.0",
+]
+train = [
+  "wandb>=0.15.0",
+  "tensorboard>=2.14.0",
+  "matplotlib>=3.7.0",
+  "seaborn>=0.12.0",
+  "pandas>=2.0.0",
+]
+all = ["sudoku-ai[dev,train]"]
+
+[project.urls]
+Homepage = "https://github.com/NIKHILSAI71/sudoku-ai"
+Repository = "https://github.com/NIKHILSAI71/sudoku-ai"
+Documentation = "https://github.com/NIKHILSAI71/sudoku-ai/tree/main/docs"
+Issues = "https://github.com/NIKHILSAI71/sudoku-ai/issues"
 
 [project.scripts]
 sudoku = "cli.main:main"
+sudoku-train = "src.training.train:main"
+sudoku-eval = "scripts.evaluate:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["sudoku_engine*", "sudoku_ai*", "cli*", "ui*"]
+include = ["src*", "cli*", "ui*"]
+exclude = ["tests*", "docs*", "notebooks*"]
 
 [tool.setuptools.package-data]
-"sudoku" = ["examples/*"]
+"sudoku-ai" = ["configs/*.yaml", "examples/*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  | __pycache__
+  | .venv
+  | build
+  | dist
+)/
+'''
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E203", "E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --tb=short --strict-markers"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
