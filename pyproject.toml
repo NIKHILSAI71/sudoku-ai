@@ -56,17 +56,17 @@ Documentation = "https://github.com/NIKHILSAI71/sudoku-ai/tree/main/docs"
 Issues = "https://github.com/NIKHILSAI71/sudoku-ai/issues"
 
 [project.scripts]
-sudoku = "cli.main:main"
-sudoku-train = "src.training.train:main"
+sudoku-solve = "scripts.solve:main"
+sudoku-train = "scripts.train:main"
 sudoku-eval = "scripts.evaluate:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*", "cli*", "ui*"]
-exclude = ["tests*", "docs*", "notebooks*"]
+include = ["src*", "scripts*", "ui*"]
+exclude = ["tests*", "docs*", "notebooks*", "examples*"]
 
 [tool.setuptools.package-data]
-"sudoku-ai" = ["configs/*.yaml", "examples/*"]
+"*" = ["configs/*.yaml", "examples/*"]
 
 [tool.black]
 line-length = 100
