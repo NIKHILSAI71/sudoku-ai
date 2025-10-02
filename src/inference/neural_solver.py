@@ -274,7 +274,7 @@ class NeuralSolver:
                 
                 # Get the single most confident cell
                 flat_probs = masked_probs.view(-1)
-                best_idx = flat_probs.argmax().item()
+                best_idx = int(flat_probs.argmax().item())
                 
                 if flat_probs[best_idx] < 0.3:
                     # Very low confidence - fill remaining with best guesses
@@ -283,14 +283,14 @@ class NeuralSolver:
                     break
                 
                 # Convert flat index to 2D coordinates
-                batch_idx = best_idx // (current.size(1) * current.size(2))
-                cell_idx = best_idx % (current.size(1) * current.size(2))
-                row = cell_idx // current.size(2)
-                col = cell_idx % current.size(2)
+                batch_idx = int(best_idx // (current.size(1) * current.size(2)))
+                cell_idx = int(best_idx % (current.size(1) * current.size(2)))
+                row = int(cell_idx // current.size(2))
+                col = int(cell_idx % current.size(2))
                 
                 # Fill the most confident cell
                 confidence = flat_probs[best_idx].item()
-                value = max_values.view(-1)[best_idx].item()
+                value = int(max_values.view(-1)[best_idx].item())
                 current[batch_idx, row, col] = value
                 
                 total_filled += 1
