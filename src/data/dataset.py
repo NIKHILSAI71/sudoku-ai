@@ -229,7 +229,10 @@ def create_curriculum_dataloaders(
     val_split: float = 0.1,
     curriculum_stage: int = 0,
     augment: bool = True,
-    num_workers: int = 4
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    prefetch_factor: Optional[int] = 2,
+    persistent_workers: bool = False
 ) -> Tuple[DataLoader, DataLoader]:
     """Create train/val dataloaders with curriculum learning.
     
@@ -241,6 +244,9 @@ def create_curriculum_dataloaders(
         curriculum_stage: Current curriculum stage
         augment: Apply augmentation to training data
         num_workers: Number of dataloader workers
+        pin_memory: Pin memory for faster GPU transfer
+        prefetch_factor: Number of batches to prefetch per worker (None if num_workers=0)
+        persistent_workers: Keep workers alive between epochs
         
     Returns:
         (train_loader, val_loader)
@@ -268,21 +274,30 @@ def create_curriculum_dataloaders(
         augment=False
     )
     
+    # DataLoader kwargs (handle num_workers=0 case)
+    loader_kwargs = {
+        'batch_size': batch_size,
+        'num_workers': num_workers,
+        'pin_memory': pin_memory
+    }
+    
+    # Only add prefetch_factor and persistent_workers if num_workers > 0
+    if num_workers > 0:
+        if prefetch_factor is not None:
+            loader_kwargs['prefetch_factor'] = prefetch_factor
+        loader_kwargs['persistent_workers'] = persistent_workers
+    
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True
+        **loader_kwargs
     )
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
+        **loader_kwargs
     )
     
     return train_loader, val_loader
