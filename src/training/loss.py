@@ -54,6 +54,12 @@ class SudokuLoss(nn.Module):
         targets_flat = targets.reshape(-1)
         mask_flat = mask.reshape(-1)
         
+        # Convert targets from 1-indexed (1-9) to 0-indexed (0-8)
+        # Model outputs grid_size classes for digits 1 to grid_size
+        # Targets contain 0 for empty cells and 1-grid_size for digits
+        # We subtract 1 to get 0-based indices, clamping to handle empty cells
+        targets_flat = (targets_flat - 1).clamp(0, num_classes - 1)
+        
         # Cross-entropy loss (only on masked cells)
         ce_loss = F.cross_entropy(logits_flat, targets_flat, reduction='none')
         ce_loss = (ce_loss * mask_flat).sum() / (mask_flat.sum() + 1e-8)
