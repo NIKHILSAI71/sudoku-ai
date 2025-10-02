@@ -164,8 +164,13 @@ def load_kaggle_dataset(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Load Kaggle Sudoku dataset.
     
+    Supports multiple Kaggle dataset formats:
+    - 'puzzle' and 'solution' columns (3M dataset)
+    - 'quizzes' and 'solutions' columns (9M dataset)
+    - First two columns as fallback
+    
     Args:
-        file_path: Path to CSV file with 'puzzle' and 'solution' columns
+        file_path: Path to CSV file with puzzle/solution data
         max_samples: Maximum samples to load (None = all)
         grid_size: Grid size (default 9x9)
         
@@ -174,6 +179,26 @@ def load_kaggle_dataset(
     """
     df = pd.read_csv(file_path)
     
+    # Auto-detect column names
+    columns = df.columns.tolist()
+    
+    # Try different common column name combinations
+    if 'puzzle' in columns and 'solution' in columns:
+        puzzle_col, solution_col = 'puzzle', 'solution'
+    elif 'quizzes' in columns and 'solutions' in columns:
+        puzzle_col, solution_col = 'quizzes', 'solutions'
+    elif len(columns) >= 2:
+        # Fallback to first two columns
+        puzzle_col, solution_col = columns[0], columns[1]
+        print(f"Warning: Using columns '{puzzle_col}' and '{solution_col}' as puzzle/solution")
+    else:
+        raise ValueError(
+            f"Cannot find puzzle/solution columns. Available columns: {columns}\n"
+            f"Expected: 'puzzle' & 'solution' OR 'quizzes' & 'solutions'"
+        )
+    
+    print(f"Loading dataset with columns: '{puzzle_col}' and '{solution_col}'")
+    
     if max_samples:
         df = df.head(max_samples)
     
@@ -181,8 +206,8 @@ def load_kaggle_dataset(
     solutions = []
     
     for _, row in df.iterrows():
-        puzzle_str = row['puzzle']
-        solution_str = row['solution']
+        puzzle_str = row[puzzle_col]
+        solution_str = row[solution_col]
         
         # Convert string to grid
         puzzle_grid = torch.tensor([int(c) for c in puzzle_str], dtype=torch.long)
