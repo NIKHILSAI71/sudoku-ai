@@ -19,7 +19,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.amp.autocast_mode import autocast
-from torch.cuda.amp import GradScaler
+from torch.amp.grad_scaler import GradScaler
 from tqdm import tqdm
 
 from ..models.gnn.sudoku_gnn import SudokuGNN
@@ -68,8 +68,8 @@ class GNNTrainer:
             use_constraint_loss=True
         )
         
-        # Mixed precision scaler
-        self.scaler = GradScaler() if self.use_amp else None
+        # Mixed precision scaler (use new torch.amp API)
+        self.scaler = GradScaler('cuda') if self.use_amp else None
         
         # Checkpointing
         self.checkpoint_dir = Path(checkpoint_dir)
