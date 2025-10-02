@@ -195,7 +195,7 @@ class GNNTrainer:
             
             # Compute accuracy
             mask = (puzzles == 0)
-            preds = logits.argmax(dim=-1)
+            preds = logits.argmax(dim=-1) + 1  # Convert 0-indexed to 1-indexed
             
             for i in range(len(puzzles)):
                 if mask[i].any():
