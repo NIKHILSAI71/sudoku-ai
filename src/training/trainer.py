@@ -39,33 +39,45 @@ class GNNTrainer:
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
         use_amp: bool = True,
-        checkpoint_dir: str = 'checkpoints'
+        checkpoint_dir: str = 'checkpoints',
+        gradient_clip: float = 1.0,
+        warmup_epochs: int = 3
     ):
-        """Initialize trainer.
+        """Initialize trainer with enhanced optimization.
         
         Args:
             model: SudokuGNN model
             device: Device to train on
-            lr: Learning rate
+            lr: Peak learning rate (after warmup)
             weight_decay: Weight decay for regularization
             use_amp: Use automatic mixed precision (FP16)
             checkpoint_dir: Directory for saving checkpoints
+            gradient_clip: Maximum gradient norm (prevents exploding gradients)
+            warmup_epochs: Number of epochs for learning rate warmup
         """
         self.model = model.to(device)
         self.device = device
         self.use_amp = use_amp and torch.cuda.is_available()
+        self.gradient_clip = gradient_clip
+        self.warmup_epochs = warmup_epochs
+        self.base_lr = lr
         
-        # Optimizer and scheduler
+        # Optimizer with improved hyperparameters
         self.optimizer = AdamW(
             model.parameters(),
             lr=lr,
-            weight_decay=weight_decay
+            weight_decay=weight_decay,
+            betas=(0.9, 0.999),
+            eps=1e-8
         )
         
-        # Loss function
+        # Enhanced loss function with focal loss and higher constraint weight
         self.criterion = SudokuLoss(
-            constraint_weight=0.1,
-            use_constraint_loss=True
+            constraint_weight=0.5,  # Increased from 0.1
+            use_constraint_loss=True,
+            use_focal_loss=True,    # Handle hard examples better
+            focal_gamma=2.0,
+            label_smoothing=0.05    # Slight regularization
         )
         
         # Mixed precision scaler (use new torch.amp API)
@@ -79,6 +91,7 @@ class GNNTrainer:
         self.best_val_acc = 0.0
         self.current_epoch = 0
         self.curriculum_stage = 0
+        self.warmup_factor = 0.1  # Start at 10% of base LR
     
     def train_epoch(
         self,
@@ -118,12 +131,21 @@ class GNNTrainer:
                 
                 # Backward pass with gradient scaling
                 self.scaler.scale(loss).backward()
+                
+                # Gradient clipping (unscale first for proper clipping)
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+                
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 logits = self.model(puzzles)
                 loss, loss_info = self.criterion(logits, solutions, puzzles)
                 loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+                
                 self.optimizer.step()
             
             # Accumulate metrics
@@ -246,9 +268,13 @@ class GNNTrainer:
         logger.info(f"Device: {self.device}, Mixed Precision: {self.use_amp}")
         logger.info(f"Curriculum stages: {curriculum_epochs}")
         
-        # Initialize scheduler
+        # Initialize scheduler with warmup
         total_epochs = sum(curriculum_epochs)
-        scheduler = CosineAnnealingLR(self.optimizer, T_max=total_epochs)
+        scheduler = CosineAnnealingLR(
+            self.optimizer, 
+            T_max=total_epochs - self.warmup_epochs,
+            eta_min=1e-6
+        )
         
         for stage_idx, stage_epochs in enumerate(curriculum_epochs):
             logger.info(f"\n{'='*50}")
@@ -272,7 +298,16 @@ class GNNTrainer:
             for epoch in range(stage_epochs):
                 self.current_epoch += 1
                 
-                logger.info(f"\nEpoch {self.current_epoch}/{total_epochs}")
+                # Learning rate warmup for first few epochs
+                if self.current_epoch <= self.warmup_epochs:
+                    warmup_progress = self.current_epoch / self.warmup_epochs
+                    lr = self.base_lr * (self.warmup_factor + (1 - self.warmup_factor) * warmup_progress)
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = lr
+                    logger.info(f"\nEpoch {self.current_epoch}/{total_epochs} [WARMUP] - LR: {lr:.6f}")
+                else:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    logger.info(f"\nEpoch {self.current_epoch}/{total_epochs} - LR: {current_lr:.6f}")
                 
                 # Train
                 train_metrics = self.train_epoch(
@@ -282,6 +317,8 @@ class GNNTrainer:
                 
                 logger.info(
                     f"Train - Loss: {train_metrics['loss']:.4f}, "
+                    f"CE Loss: {train_metrics['ce_loss']:.4f}, "
+                    f"Constraint Loss: {train_metrics['constraint_loss']:.4f}, "
                     f"Accuracy: {train_metrics['accuracy']:.2f}%"
                 )
                 
@@ -297,8 +334,9 @@ class GNNTrainer:
                     f"Grid Acc: {val_metrics['grid_accuracy']:.2f}%"
                 )
                 
-                # Update scheduler
-                scheduler.step()
+                # Update scheduler (after warmup)
+                if self.current_epoch > self.warmup_epochs:
+                    scheduler.step()
                 
                 # Save checkpoint
                 self.save_checkpoint(
